@@ -1,4 +1,4 @@
-#![cfg(target_os = "linux")]
+#![cfg(any(target_os = "linux", target_os = "android"))]
 
 pub mod config;
 pub mod control;
@@ -6,7 +6,12 @@ pub mod derp;
 pub mod discovery;
 pub mod engine;
 pub mod filter;
+pub mod mobile;
 pub mod model;
+#[cfg(target_os = "linux")]
+pub mod network;
+#[cfg(target_os = "android")]
+#[path = "network_android.rs"]
 pub mod network;
 pub mod state;
 pub mod transport;

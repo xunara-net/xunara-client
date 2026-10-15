@@ -9,6 +9,24 @@ permissions:
   contents: read
 
 jobs:
+  android-platform:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - name: Android NDK and Rust target
+        run: |
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" 'ndk;29.0.14206865'
+          rustup target add aarch64-linux-android
+      - name: Check Android data plane
+        run: |
+          export CC_aarch64_linux_android="$ANDROID_HOME/ndk/29.0.14206865/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android26-clang"
+          export AR_aarch64_linux_android="$ANDROID_HOME/ndk/29.0.14206865/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-ar"
+          cargo clippy --locked --lib --target aarch64-linux-android -- -D warnings
   core:
     runs-on: ubuntu-24.04
     timeout-minutes: 30

@@ -16,6 +16,10 @@ Linux TUN ← ACL + Cryptokey routing ← BoringTun WireGuard
 
 `control`、`model`、`filter`、`network`、`engine`、`derp`、`discovery` 各有明确边界。不链接既有 Go Agent 或完整的 tsnet 用户态 TCP 栈，不把平台 UI、账号 Session、计费或文件服务引入数据面。
 
+Android 使用同一 `engine` / `control` / ACL / WireGuard / DERP，只有 `network_android` 替换 Linux 的网卡与路由操作。`mobile::Host` 是向外的平台接口，不依赖 Kotlin / Flutter；应用持有 VpnService，逐个保护外层 socket，移交 TUN fd 的唯一所有权。未取得有效映射时 TUN 读取保持挂起，不用空 VPN 冒充已接入。平台路由计划的单测覆盖 host prefix、跳过 LAN 冲突、拒绝默认路由和拒绝 Android 转发模式。
+
+参考 [Android VPN 官方文档](https://developer.android.com/develop/connectivity/vpn) 和 [Tailscale Android 套接字保护实现](https://github.com/tailscale/tailscale/blob/v1.104.1/net/netns/netns_android.go)。协议 wire 没有 Android 专有分支；只按运行平台报告既有 Hostinfo.OS。
+
 ## Why
 
 最小体积目标优先 Linux CLI 和内核 IP 转发，而非复制完整客户端产品。只复用官方 Rust 上游的底层 Noise / key 组件；官方高层库仍未提供当前所需的完整子网路由与私有 DERP 产品能力，因此不直接把该库包装成“已经完成”的客户端。

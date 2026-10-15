@@ -2,6 +2,8 @@
 
 面向 Linux 服务器 / 路由器的最小客户端。无 GUI、Web 管理面、文件传输、SSH 服务或 Go 运行时；只保留加密组网、直接连接、DERP 回退和子网转发。
 
+本仓库同时提供 Android 的 Rust 数据面适配接口；Flutter 界面与 APK 位于独立 [xunara-android](https://github.com/xunara-net/xunara-android) 仓库，不混入 Linux CLI。
+
 **这是首版最小实现，不是官方 Tailscale 客户端的完整替代品。** 先在测试网络验证，再部署关键业务。当前外层 UDP 使用 IPv4，隧道处理 IPv4 / IPv6 的 TCP、UDP 和 ICMP；不支持 IP 分片或 IPv6 扩展头。可见节点上限 256。
 
 ## 已实现
@@ -65,7 +67,15 @@ sudo xunara-client status --state-dir /var/lib/xunara-client
 
 ## 暂不支持
 
-GUI、Windows / macOS / Android、MagicDNS、接管 DNS、Exit Node、Tailnet Lock、跨租户设备共享 / 地址 masquerade、服务发布、SSH、文件传输、UDP Peer Relay、自动升级、内核 WireGuard 后端。子网默认路由 `/0` 明确拒绝。无法理解的网络协议 / 规则不会被解释成放行。
+本仓库内的 GUI、Windows / macOS、MagicDNS、接管 DNS、Exit Node、Tailnet Lock、跨租户设备共享 / 地址 masquerade、服务发布、SSH、文件传输、UDP Peer Relay、自动升级、内核 WireGuard 后端。子网默认路由 `/0` 明确拒绝。无法理解的网络协议 / 规则不会被解释成放行。
+
+## Android 平台接口
+
+Android 通过 `mobile::Host` 注入系统授权后的 TUN、套接字保护、当前 LAN 与状态回调。`network_android` 不执行 `ip` / `nft`，不调用 `/dev/net/tun`，不引入 Android JNI 或 Flutter 依赖；宿主代码在独立应用仓库维护。
+
+移动端仅接收已批准子网，不广播路由，不要求 root，不充当子网路由器。每个 TCP / UDP 外层 socket 在使用前调用 `VpnService.protect`；TUN 只在收到授权映射后创建，地址使用 host prefix，冲突 LAN 优先，默认出口和 DNS 保持不变。界面状态不包含机器私钥或预授权密钥；详细节点状态仅经内存回调，不扩张 CLI 的磁盘状态文件。
+
+具体 Android 版本、APK 签名、模拟器与真机验收边界以应用仓库记录为准，不能将 Linux 发布二进制当成 Android 可执行文件。
 
 UDP STUN 是打洞与地址发现，**不是 UDP 业务中继**；DERP 业务回退仍通过 TLS / TCP。后续 UDP Peer Relay 必须遵循官方分配 / 授权协议，不能把裸 UDP 转发器伪装为兼容实现。
 

@@ -22,8 +22,7 @@ pub async fn connect(url: &Url, certificate: &str, target: Option<&str>) -> Resu
     let host = url.host_str().context("缺少服务器主机")?;
     let port = url.port_or_known_default().context("缺少服务器端口")?;
     let target = target.filter(|target| !target.is_empty()).unwrap_or(host);
-    let socket =
-        tokio::time::timeout(Duration::from_secs(10), TcpStream::connect((target, port))).await??;
+    let socket = connect_tcp(target, port).await?;
     socket.set_nodelay(true)?;
     if url.scheme() == "http" {
         ensure!(
@@ -57,6 +56,37 @@ pub async fn connect(url: &Url, certificate: &str, target: Option<&str>) -> Resu
     )
     .await??;
     Ok(Box::new(secured))
+}
+
+#[cfg(target_os = "linux")]
+async fn connect_tcp(host: &str, port: u16) -> Result<TcpStream> {
+    Ok(tokio::time::timeout(Duration::from_secs(10), TcpStream::connect((host, port))).await??)
+}
+
+#[cfg(target_os = "android")]
+async fn connect_tcp(host: &str, port: u16) -> Result<TcpStream> {
+    use std::os::fd::AsRawFd;
+    let addresses = tokio::time::timeout(
+        Duration::from_secs(10),
+        tokio::net::lookup_host((host, port)),
+    )
+    .await??;
+    let mut last = None;
+    for address in addresses.take(8) {
+        let socket = if address.is_ipv4() {
+            tokio::net::TcpSocket::new_v4()?
+        } else {
+            tokio::net::TcpSocket::new_v6()?
+        };
+        // 控制面和 DERP 都必须在 connect 前保护，不能被自己安装的路由递归接管。
+        crate::mobile::host()?.protect(socket.as_raw_fd())?;
+        match tokio::time::timeout(Duration::from_secs(10), socket.connect(address)).await {
+            Ok(Ok(stream)) => return Ok(stream),
+            Ok(Err(error)) => last = Some(error.into()),
+            Err(error) => last = Some(error.into()),
+        }
+    }
+    Err(last.unwrap_or_else(|| anyhow::anyhow!("服务器没有可用地址")))
 }
 
 #[derive(Debug)]

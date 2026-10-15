@@ -139,6 +139,11 @@ impl Engine {
     ) -> Result<Self> {
         network::forwarding_ready(&config)?;
         let socket = Arc::new(UdpSocket::bind(config.listen).await?);
+        #[cfg(target_os = "android")]
+        {
+            use std::os::fd::AsRawFd;
+            crate::mobile::host()?.protect(socket.as_raw_fd())?;
+        }
         let local = network::local_endpoints(socket.local_addr()?.port(), &config.interface);
         endpoints.send_replace(local);
         let tun = Tun::create(&config).await?;
@@ -218,6 +223,8 @@ impl Engine {
                 Event::Derp(None) => anyhow::bail!("中继输入已停止"),
                 Event::Tick => {
                     self.tick().await?;
+                    #[cfg(target_os = "android")]
+                    crate::mobile::publish(&self.snapshot());
                     if self.ticks.is_multiple_of(10) {
                         self.status(store)?;
                     }
@@ -251,6 +258,8 @@ impl Engine {
         );
         let filter = Filter::compile(&map.filter)?;
         self.routes.apply(&self.config, &map).await?;
+        #[cfg(target_os = "android")]
+        self.tun.install(self.routes.take_descriptor())?;
         self.peers.retain(|identity, _| {
             nodes
                 .iter()
@@ -705,16 +714,33 @@ impl Engine {
     }
 
     pub fn status(&self, store: &Store) -> Result<()> {
-        store.write("status.json",&json!({"version":crate::VERSION,"updated_at":time::OffsetDateTime::now_utc().unix_timestamp(),
+        let mut snapshot = self.snapshot();
+        #[cfg(target_os = "android")]
+        crate::mobile::publish(&snapshot);
+        // 移动端节点清单只经内存回调传递，避免扩大磁盘状态与 CLI 读取上限。
+        snapshot
+            .as_object_mut()
+            .expect("snapshot object")
+            .remove("devices");
+        store.write("status.json", &snapshot)
+    }
+
+    pub fn snapshot(&self) -> serde_json::Value {
+        json!({"type":"status","version":crate::VERSION,"updated_at":time::OffsetDateTime::now_utc().unix_timestamp(),
             "online":self.fresh(),"interface":self.config.interface,"addresses":self.map.node.as_ref().map(|node| &node.addresses),
             "peers":self.peers.len(),"direct_peers":self.peers.values().filter(|peer| peer.direct.is_some_and(|(_,seen)| seen.elapsed() < Duration::from_secs(25))).count(),
-            "bytes_received":self.received_bytes,"bytes_sent":self.sent_bytes,"advertised_routes":self.config.advertise_routes}))
+            "bytes_received":self.received_bytes,"bytes_sent":self.sent_bytes,"advertised_routes":self.config.advertise_routes,
+            "devices":self.peers.values().map(|peer| json!({"id":peer.node.id.to_string(),"name":peer.node.name,"addresses":peer.node.addresses,
+                "authorized":peer.node.valid(),"path":if peer.direct.is_some_and(|(_,seen)| seen.elapsed()<Duration::from_secs(25)){"direct"}else{"relay"},
+                "relay_region":peer.node.relay_region()})).collect::<Vec<_>>()})
     }
 
     pub async fn stop(&mut self) -> Result<()> {
         self.last_map = None;
         self.peers.clear();
         self.hub = Hub::default();
+        #[cfg(target_os = "android")]
+        self.tun.close();
         self.routes.stop(&self.config.interface).await
     }
 }

@@ -164,7 +164,10 @@ impl Client {
                     && target.password().is_none(),
                 "拒绝跨站设备授权地址"
             );
+            #[cfg(target_os = "linux")]
             eprintln!("请在浏览器登录自己的账号并批准设备：{target}");
+            #[cfg(target_os = "android")]
+            crate::mobile::publish(&json!({"type":"authorization","url":target.as_str()}));
             return Ok(false);
         }
         ensure!(
@@ -213,7 +216,7 @@ impl Client {
 }
 
 fn hostinfo(config: &Config, region: u16) -> Value {
-    json!({"Hostname":config.hostname,"OS":"linux","IPNVersion":format!("xunara-client/{VERSION}"),
+    json!({"Hostname":config.hostname,"OS":std::env::consts::OS,"IPNVersion":format!("xunara-client/{VERSION}"),
         "RoutableIPs":config.advertise_routes,"NetInfo":{"PreferredDERP":region}})
 }
 
@@ -239,8 +242,18 @@ pub async fn run(
         {
             Ok(()) => bail!("网络映射接收端已停止"),
             Err(error) => {
-                eprintln!("控制连接失败：{error:#}");
-                eprintln!("控制面连接中断；重试间隔 {retry} 秒，失联超过 120 秒后停止转发");
+                #[cfg(target_os = "linux")]
+                {
+                    eprintln!("控制连接失败：{error:#}");
+                    eprintln!("控制面连接中断；重试间隔 {retry} 秒，失联超过 120 秒后停止转发");
+                }
+                #[cfg(target_os = "android")]
+                {
+                    // 只显示本地错误上下文；注册响应正文、请求对象和密钥不进入诊断。
+                    crate::mobile::publish(
+                        &json!({"type":"reconnecting","message":format!("连接失败：{error}；{retry} 秒后重试")}),
+                    );
+                }
                 tokio::time::sleep(Duration::from_secs(retry)).await;
                 retry = (retry * 2).min(30);
             }
