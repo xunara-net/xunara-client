@@ -1,0 +1,67 @@
+name: Rust core and official-client compatibility
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  core:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: xunara-client
+      - uses: actions/checkout@v4
+        with:
+          repository: xunara-net/xunara-server
+          ref: dd158e973358a01f15c5e6e79c0a38d35afb3989
+          path: xunara-server
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: xunara-client/tests/compat/go.mod
+          cache-dependency-path: xunara-client/tests/compat/go.sum
+      - name: Toolchain
+        working-directory: xunara-client
+        run: rustup show
+      - name: Rust checks
+        working-directory: xunara-client
+        run: |
+          cargo fmt --check
+          cargo clippy --locked --all-targets -- -D warnings
+          cargo test --locked --all-targets
+          cargo build --locked --release
+      - name: Official Go compatibility fixture
+        working-directory: xunara-client/tests/compat
+        run: |
+          go vet ./...
+          go test -race ./...
+          go build -race -o ../../target/compat-fixture .
+      - name: Upstream STUN wire contract
+        working-directory: xunara-client
+        run: cargo test --locked --test upstream -- --ignored
+      - name: Isolated real data plane
+        working-directory: xunara-client
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y nftables
+          sudo unshare --net --mount sh scripts/test-netns.sh --inside
+          sudo env XUNARA_TEST_SNAT=true unshare --net --mount sh scripts/test-netns.sh --inside
+      - name: Static Linux AMD64 and ARM64
+        working-directory: xunara-client
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang
+          version=$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -1)
+          sh scripts/build-release.sh "v$version" "$RUNNER_TEMP/client-release"
+          cd "$RUNNER_TEMP/client-release"
+          sha256sum --check SHA256SUMS
+          ./xunara-client_linux_amd64 --version
+      - uses: actions/upload-artifact@v4
+        with:
+          name: static-linux-client
+          path: ${{ runner.temp }}/client-release/

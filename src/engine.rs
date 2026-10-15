@@ -1,0 +1,720 @@
+use std::{
+    collections::{BTreeMap, BTreeSet, VecDeque},
+    net::SocketAddr,
+    sync::Arc,
+    time::{Duration, Instant},
+};
+
+use anyhow::{Context, Result, ensure};
+use boringtun::{
+    noise::{Tunn, TunnResult, rate_limiter::RateLimiter},
+    x25519,
+};
+use ipnet::IpNet;
+use serde_json::json;
+use tokio::{
+    net::UdpSocket,
+    sync::{mpsc, watch},
+};
+
+use crate::{
+    config::Config,
+    derp::{Hub, Received},
+    discovery,
+    filter::{Filter, Packet},
+    model::{NetworkMap, Node},
+    network::{self, Routes, Tun},
+    state::{Identity, Store, parse_key},
+};
+
+#[derive(Clone, Copy)]
+enum Path {
+    Udp(SocketAddr),
+    Derp(u16),
+}
+enum Output {
+    Wire(Vec<u8>),
+    Plain(Vec<u8>),
+    Done,
+    Invalid,
+}
+
+impl From<TunnResult<'_>> for Output {
+    fn from(result: TunnResult<'_>) -> Self {
+        match result {
+            TunnResult::WriteToNetwork(bytes) => Self::Wire(bytes.to_vec()),
+            TunnResult::WriteToTunnelV4(bytes, _) | TunnResult::WriteToTunnelV6(bytes, _) => {
+                Self::Plain(bytes.to_vec())
+            }
+            TunnResult::Done => Self::Done,
+            TunnResult::Err(_) => Self::Invalid,
+        }
+    }
+}
+
+struct Peer {
+    node: Node,
+    key: [u8; 32],
+    disco: Option<[u8; 32]>,
+    tunnel: Tunn,
+    index: u32,
+    direct: Option<(SocketAddr, Instant)>,
+    probes: VecDeque<([u8; 12], SocketAddr, Instant)>,
+    extra_endpoints: Vec<SocketAddr>,
+}
+
+impl Peer {
+    fn endpoints(&self) -> Vec<SocketAddr> {
+        self.node
+            .endpoints
+            .iter()
+            .chain(&self.extra_endpoints)
+            .filter(|address| {
+                address.is_ipv4()
+                    && !address.ip().is_loopback()
+                    && !address.ip().is_unspecified()
+                    && !address.ip().is_multicast()
+                    && address.port() != 0
+            })
+            .copied()
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .take(16)
+            .collect()
+    }
+
+    fn source_allowed(&self, packet: Packet) -> bool {
+        self.node
+            .addresses
+            .iter()
+            .chain(&self.node.allowed_ips)
+            .any(|network| network.prefix_len() > 0 && network.contains(&packet.source))
+    }
+
+    fn prefix(&self, packet: Packet, accept_routes: bool) -> Option<u8> {
+        self.node
+            .addresses
+            .iter()
+            .chain(if accept_routes {
+                self.node.allowed_ips.iter()
+            } else {
+                [].iter()
+            })
+            .filter(|network| network.prefix_len() > 0 && network.contains(&packet.destination))
+            .map(IpNet::prefix_len)
+            .max()
+    }
+}
+
+pub struct Engine {
+    config: Arc<Config>,
+    identity: Arc<Identity>,
+    socket: Arc<UdpSocket>,
+    tun: Tun,
+    routes: Routes,
+    peers: BTreeMap<u64, Peer>,
+    map: NetworkMap,
+    filter: Filter,
+    last_map: Option<Instant>,
+    next_index: u32,
+    hub: Hub,
+    derp_input: mpsc::Receiver<Received>,
+    derp_output: mpsc::Sender<Received>,
+    endpoints: watch::Sender<Vec<String>>,
+    stun: Vec<([u8; 12], SocketAddr, Instant)>,
+    mapped: BTreeMap<SocketAddr, Instant>,
+    own_node: [u8; 32],
+    limiter: Arc<RateLimiter>,
+    received_bytes: u64,
+    sent_bytes: u64,
+    ticks: u64,
+    budget: u32,
+}
+
+impl Engine {
+    pub async fn new(
+        config: Arc<Config>,
+        identity: Arc<Identity>,
+        endpoints: watch::Sender<Vec<String>>,
+    ) -> Result<Self> {
+        network::forwarding_ready(&config)?;
+        let socket = Arc::new(UdpSocket::bind(config.listen).await?);
+        let local = network::local_endpoints(socket.local_addr()?.port(), &config.interface);
+        endpoints.send_replace(local);
+        let tun = Tun::create(&config).await?;
+        let own_node = *crypto_box::SecretKey::from(identity.node)
+            .public_key()
+            .as_bytes();
+        let limiter = Arc::new(RateLimiter::new(&x25519::PublicKey::from(own_node), 50));
+        let (derp_output, derp_input) = mpsc::channel(256);
+        Ok(Self {
+            config,
+            identity,
+            socket,
+            tun,
+            routes: Routes::default(),
+            peers: BTreeMap::new(),
+            map: NetworkMap::default(),
+            filter: Filter::default(),
+            last_map: None,
+            next_index: 1,
+            hub: Hub::default(),
+            derp_input,
+            derp_output,
+            endpoints,
+            stun: Vec::new(),
+            mapped: BTreeMap::new(),
+            own_node,
+            limiter,
+            received_bytes: 0,
+            sent_bytes: 0,
+            ticks: 0,
+            budget: 100,
+        })
+    }
+
+    pub async fn run(&mut self, mut maps: mpsc::Receiver<NetworkMap>, store: &Store) -> Result<()> {
+        let mut udp = vec![0; 65568];
+        let mut packet = vec![0; 65536];
+        let mut ticker = tokio::time::interval(Duration::from_secs(1));
+        loop {
+            enum Event {
+                Map(Option<Box<NetworkMap>>),
+                Udp(std::io::Result<(usize, SocketAddr)>),
+                Packet(std::io::Result<usize>),
+                Derp(Option<Received>),
+                Tick,
+            }
+            let event = tokio::select! {
+                map = maps.recv() => Event::Map(map.map(Box::new)),
+                received = self.socket.recv_from(&mut udp) => Event::Udp(received),
+                length = self.tun.read(&mut packet) => Event::Packet(length),
+                received = self.derp_input.recv() => Event::Derp(received),
+                _ = ticker.tick() => Event::Tick,
+            };
+            match event {
+                Event::Map(map) => {
+                    self.apply(*map.context("控制面任务已停止")?).await?;
+                    self.status(store)?;
+                }
+                Event::Udp(received) => {
+                    if let Ok((length, source)) = received {
+                        self.receive(None, Path::Udp(source), &udp[..length])
+                            .await?;
+                    }
+                }
+                Event::Packet(length) => {
+                    let length = length?;
+                    self.outgoing(&packet[..length]).await?;
+                }
+                Event::Derp(Some(received)) => {
+                    self.receive(
+                        Some(received.peer),
+                        Path::Derp(received.region),
+                        &received.bytes,
+                    )
+                    .await?
+                }
+                Event::Derp(None) => anyhow::bail!("中继输入已停止"),
+                Event::Tick => {
+                    self.tick().await?;
+                    if self.ticks.is_multiple_of(10) {
+                        self.status(store)?;
+                    }
+                }
+            }
+        }
+    }
+
+    fn fresh(&self) -> bool {
+        self.last_map
+            .is_some_and(|received| received.elapsed() < Duration::from_secs(120))
+            && self.map.node.as_ref().is_some_and(Node::valid)
+    }
+
+    async fn apply(&mut self, map: NetworkMap) -> Result<()> {
+        let node = map.node.as_ref().context("缺少设备映射")?;
+        ensure!(
+            node.valid() && parse_key(&node.key, "nodekey:")? == self.own_node,
+            "本机映射密钥不匹配或未授权"
+        );
+        let nodes = map.nodes()?;
+        let keys = nodes
+            .iter()
+            .filter(|node| node.valid())
+            .map(|node| parse_key(&node.key, "nodekey:"))
+            .collect::<Result<Vec<_>>>()?;
+        ensure!(
+            keys.iter().collect::<BTreeSet<_>>().len() == keys.len()
+                && !keys.contains(&self.own_node),
+            "网络映射含重复或本机 peer key"
+        );
+        let filter = Filter::compile(&map.filter)?;
+        self.routes.apply(&self.config, &map).await?;
+        self.peers.retain(|identity, _| {
+            nodes
+                .iter()
+                .any(|node| node.id == *identity && node.valid())
+        });
+        for node in nodes.into_iter().filter(Node::valid) {
+            let key = parse_key(&node.key, "nodekey:")?;
+            let disco = if node.disco_key.is_empty() {
+                None
+            } else {
+                Some(parse_key(&node.disco_key, "discokey:")?)
+            };
+            if let Some(peer) = self.peers.get_mut(&node.id).filter(|peer| peer.key == key) {
+                if peer.disco != disco {
+                    peer.direct = None;
+                    peer.probes.clear();
+                }
+                peer.node = node;
+                peer.disco = disco;
+                continue;
+            }
+            ensure!(self.next_index < 1 << 24, "隧道索引已耗尽，请重启客户端");
+            let index = self.next_index;
+            self.next_index += 1;
+            let tunnel = Tunn::new(
+                self.identity.node.into(),
+                key.into(),
+                None,
+                Some(20),
+                index,
+                Some(self.limiter.clone()),
+            );
+            self.peers.insert(
+                node.id,
+                Peer {
+                    node,
+                    key,
+                    disco,
+                    tunnel,
+                    index,
+                    direct: None,
+                    probes: VecDeque::new(),
+                    extra_endpoints: Vec::new(),
+                },
+            );
+        }
+        if self.map.filter != map.filter || !self.fresh() {
+            self.filter = filter;
+        }
+        let mut regions = self
+            .peers
+            .values()
+            .map(|peer| peer.node.relay_region())
+            .filter(|region| *region > 0)
+            .collect::<BTreeSet<_>>();
+        if let Some(region) = map.derp.regions.keys().next() {
+            regions.insert(*region);
+        }
+        self.hub.update(
+            &map.derp,
+            &regions.into_iter().collect::<Vec<_>>(),
+            self.identity.node,
+            self.derp_output.clone(),
+        )?;
+        self.map = map;
+        self.last_map = Some(Instant::now());
+        Ok(())
+    }
+
+    async fn outgoing(&mut self, bytes: &[u8]) -> Result<()> {
+        if !self.fresh() {
+            return Ok(());
+        }
+        let Some(packet) = Packet::parse(bytes) else {
+            return Ok(());
+        };
+        if !self.routes.local_source(packet.source) {
+            return Ok(());
+        }
+        let selected = self
+            .peers
+            .iter()
+            .filter(|(_, peer)| peer.node.valid())
+            .filter_map(|(identity, peer)| {
+                peer.prefix(packet, self.config.accept_routes)
+                    .map(|prefix| (*identity, prefix))
+            })
+            .max_by_key(|(_, prefix)| *prefix)
+            .map(|(identity, _)| identity);
+        let Some(selected) = selected else {
+            return Ok(());
+        };
+        self.filter.outgoing(packet);
+        self.sent_bytes += bytes.len() as u64;
+        let mut output = vec![0; 65568];
+        let action = Output::from(
+            self.peers
+                .get_mut(&selected)
+                .context("peer 已删除")?
+                .tunnel
+                .encapsulate(bytes, &mut output),
+        );
+        if let Output::Wire(bytes) = action {
+            self.transmit(selected, None, &bytes).await;
+        }
+        Ok(())
+    }
+
+    async fn transmit(&self, identity: u64, path: Option<Path>, bytes: &[u8]) {
+        let Some(peer) = self.peers.get(&identity) else {
+            return;
+        };
+        if let Some(path) = path {
+            match path {
+                Path::Udp(address) => {
+                    let _ = self.socket.send_to(bytes, address).await;
+                }
+                Path::Derp(region) => self.hub.send(region, peer.key, bytes),
+            }
+            return;
+        }
+        if let Some((address, last)) = peer
+            .direct
+            .filter(|(_, last)| last.elapsed() < Duration::from_secs(25))
+        {
+            let _ = last;
+            let _ = self.socket.send_to(bytes, address).await;
+        } else {
+            for address in peer.endpoints() {
+                let _ = self.socket.send_to(bytes, address).await;
+            }
+            self.hub.send(peer.node.relay_region(), peer.key, bytes);
+        }
+    }
+
+    async fn receive(&mut self, known: Option<[u8; 32]>, path: Path, bytes: &[u8]) -> Result<()> {
+        if !self.fresh() {
+            return Ok(());
+        }
+        if let Path::Udp(source) = path
+            && bytes.len() >= 20
+            && bytes[4..8] == [0x21, 0x12, 0xa4, 0x42]
+        {
+            for (transaction, target, sent) in &self.stun {
+                if source == *target
+                    && sent.elapsed() < Duration::from_secs(10)
+                    && let Some(mapped) = discovery::stun_response(bytes, transaction)
+                {
+                    self.mapped.insert(mapped, Instant::now());
+                }
+            }
+            self.publish_endpoints()?;
+            return Ok(());
+        }
+        if bytes.starts_with(discovery::MAGIC) {
+            if self.budget == 0 {
+                return Ok(());
+            }
+            self.budget -= 1;
+            self.disco(known, path, bytes).await;
+            return Ok(());
+        }
+        let parsed = match Tunn::parse_incoming_packet(bytes) {
+            Ok(packet) => packet,
+            Err(_) => return Ok(()),
+        };
+        let receiver = match parsed {
+            boringtun::noise::Packet::HandshakeInit(_) => None,
+            boringtun::noise::Packet::HandshakeResponse(response) => {
+                Some(response.receiver_idx >> 8)
+            }
+            boringtun::noise::Packet::PacketCookieReply(cookie) => Some(cookie.receiver_idx >> 8),
+            boringtun::noise::Packet::PacketData(packet) => Some(packet.receiver_idx >> 8),
+        };
+        if receiver.is_none() {
+            if self.budget == 0 {
+                return Ok(());
+            }
+            self.budget -= 1;
+        }
+        let candidates = self
+            .peers
+            .iter()
+            .filter(|(_, peer)| {
+                peer.node.valid()
+                    && known.is_none_or(|known| known == peer.key)
+                    && receiver.is_none_or(|receiver| receiver == peer.index)
+            })
+            .map(|(identity, _)| *identity)
+            .collect::<Vec<_>>();
+        let mut scratch = vec![0; 65568];
+        for identity in candidates {
+            let source = match path {
+                Path::Udp(address) => Some(address.ip()),
+                Path::Derp(_) => None,
+            };
+            let action = Output::from(
+                self.peers
+                    .get_mut(&identity)
+                    .context("peer 丢失")?
+                    .tunnel
+                    .decapsulate(source, bytes, &mut scratch),
+            );
+            if matches!(action, Output::Invalid) {
+                continue;
+            }
+            let authenticated = match &action {
+                Output::Plain(_) => true,
+                Output::Done => bytes.first() == Some(&4),
+                Output::Wire(bytes) => matches!(bytes.first(), Some(2 | 4)),
+                Output::Invalid => false,
+            };
+            if authenticated && let Path::Udp(address) = path {
+                self.peers.get_mut(&identity).context("peer 丢失")?.direct =
+                    Some((address, Instant::now()));
+            }
+            self.process(identity, path, action).await?;
+            for _ in 0..256 {
+                let action = Output::from(
+                    self.peers
+                        .get_mut(&identity)
+                        .context("peer 丢失")?
+                        .tunnel
+                        .decapsulate(None, &[], &mut scratch),
+                );
+                if matches!(action, Output::Done | Output::Invalid) {
+                    break;
+                }
+                self.process(identity, path, action).await?;
+            }
+            break;
+        }
+        Ok(())
+    }
+
+    async fn process(&mut self, identity: u64, path: Path, output: Output) -> Result<()> {
+        match output {
+            Output::Wire(bytes) => self.transmit(identity, Some(path), &bytes).await,
+            Output::Plain(bytes) => {
+                if let Some(packet) = Packet::parse(&bytes)
+                    && self
+                        .peers
+                        .get(&identity)
+                        .is_some_and(|peer| peer.source_allowed(packet))
+                    && !self.peers.iter().any(|(other, peer)| {
+                        *other != identity
+                            && peer
+                                .node
+                                .addresses
+                                .iter()
+                                .any(|address| address.contains(&packet.source))
+                    })
+                    && self.routes.local_destination(packet.destination)
+                    && self.filter.incoming(packet)
+                {
+                    self.tun.write(&bytes).await?;
+                    self.received_bytes += bytes.len() as u64;
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    async fn disco(&mut self, known: Option<[u8; 32]>, path: Path, bytes: &[u8]) {
+        if bytes.len() < 78 {
+            return;
+        }
+        let Some(identity) = self
+            .peers
+            .iter()
+            .find(|(_, peer)| {
+                peer.node.valid()
+                    && known.is_none_or(|key| key == peer.key)
+                    && peer.disco.is_some_and(|disco| bytes[6..38] == disco)
+            })
+            .map(|(identity, _)| *identity)
+        else {
+            return;
+        };
+        let Some(peer) = self.peers.get_mut(&identity) else {
+            return;
+        };
+        let Some(disco) = peer.disco else {
+            return;
+        };
+        let Some(message) = discovery::open(&self.identity.disco, &disco, bytes) else {
+            return;
+        };
+        if message.len() < 2 || message[1] != 0 {
+            return;
+        }
+        match (message[0], path) {
+            (1, Path::Udp(source)) if message.len() >= 14 => {
+                if message.len() >= 46 && message[14..46] != [0; 32] && message[14..46] != peer.key
+                {
+                    return;
+                }
+                let pong = discovery::pong(&message[2..14], source);
+                if let Some(bytes) = discovery::seal(&self.identity.disco, &disco, &pong) {
+                    let _ = self.socket.send_to(&bytes, source).await;
+                }
+            }
+            (2, Path::Udp(source)) if message.len() >= 32 => {
+                if peer.probes.iter().any(|(transaction, target, sent)| {
+                    transaction.as_slice() == &message[2..14]
+                        && *target == source
+                        && sent.elapsed() < Duration::from_secs(10)
+                }) {
+                    peer.direct = Some((source, Instant::now()));
+                }
+            }
+            (3, Path::Derp(_)) => {
+                let (addresses, remainder) = message[2..].as_chunks::<18>();
+                if !remainder.is_empty() {
+                    return;
+                }
+                peer.extra_endpoints = addresses
+                    .iter()
+                    .filter_map(|bytes| discovery::address(bytes))
+                    .take(16)
+                    .collect();
+                self.probe(identity).await;
+            }
+            _ => {}
+        }
+    }
+
+    async fn probe(&mut self, identity: u64) {
+        let Some(peer) = self.peers.get_mut(&identity) else {
+            return;
+        };
+        let Some(disco) = peer.disco else {
+            return;
+        };
+        peer.probes
+            .retain(|(_, _, sent)| sent.elapsed() < Duration::from_secs(10));
+        for target in peer.endpoints() {
+            if peer.probes.len() >= 32 {
+                break;
+            }
+            let transaction = discovery::transaction();
+            if let Some(bytes) = discovery::seal(
+                &self.identity.disco,
+                &disco,
+                &discovery::ping(transaction, &self.own_node),
+            ) {
+                let _ = self.socket.send_to(&bytes, target).await;
+                peer.probes.push_back((transaction, target, Instant::now()));
+            }
+        }
+    }
+
+    async fn tick(&mut self) -> Result<()> {
+        self.ticks += 1;
+        self.budget = 100;
+        self.limiter.reset_count();
+        if !self.fresh() {
+            self.filter = Filter::default();
+            return Ok(());
+        }
+        let identities = self.peers.keys().copied().collect::<Vec<_>>();
+        let mut scratch = vec![0; 65568];
+        for identity in identities {
+            if !self.peers[&identity].node.valid() {
+                continue;
+            }
+            let action = Output::from(
+                self.peers
+                    .get_mut(&identity)
+                    .context("peer 丢失")?
+                    .tunnel
+                    .update_timers(&mut scratch),
+            );
+            if let Output::Wire(bytes) = action {
+                self.transmit(identity, None, &bytes).await;
+            }
+            if self.ticks % 10 == 1 {
+                self.probe(identity).await;
+                let peer = &self.peers[&identity];
+                if let Some(disco) = peer.disco {
+                    let endpoints = self
+                        .endpoints
+                        .borrow()
+                        .iter()
+                        .filter_map(|endpoint| endpoint.parse().ok())
+                        .collect::<Vec<_>>();
+                    if let Some(bytes) = discovery::seal(
+                        &self.identity.disco,
+                        &disco,
+                        &discovery::call_me_maybe(&endpoints),
+                    ) {
+                        self.hub.send(peer.node.relay_region(), peer.key, &bytes);
+                    }
+                }
+            }
+        }
+        if self.ticks % 30 == 1 {
+            self.stun.clear();
+            for region in self.map.derp.regions.values().take(4) {
+                if let Some(node) = region.nodes.iter().find(|node| node.stun_port >= 0) {
+                    let port = if node.stun_port == 0 {
+                        3478
+                    } else {
+                        node.stun_port as u16
+                    };
+                    let host = if node.ipv4.is_empty() {
+                        &node.host_name
+                    } else {
+                        &node.ipv4
+                    };
+                    if let Ok(Ok(addresses)) = tokio::time::timeout(
+                        Duration::from_secs(2),
+                        tokio::net::lookup_host((host.as_str(), port)),
+                    )
+                    .await
+                        && let Some(target) =
+                            addresses.filter(SocketAddr::is_ipv4).find(|address| {
+                                !address.ip().is_unspecified() && !address.ip().is_multicast()
+                            })
+                    {
+                        let transaction = discovery::transaction();
+                        self.socket
+                            .send_to(&discovery::stun_request(transaction), target)
+                            .await?;
+                        self.stun.push((transaction, target, Instant::now()));
+                    }
+                }
+            }
+            self.publish_endpoints()?;
+        }
+        Ok(())
+    }
+
+    fn publish_endpoints(&mut self) -> Result<()> {
+        self.mapped
+            .retain(|_, seen| seen.elapsed() < Duration::from_secs(120));
+        let mut endpoints =
+            network::local_endpoints(self.socket.local_addr()?.port(), &self.config.interface);
+        endpoints.extend(self.mapped.keys().take(8).map(ToString::to_string));
+        endpoints.sort();
+        endpoints.dedup();
+        self.endpoints.send_if_modified(|old| {
+            if *old == endpoints {
+                false
+            } else {
+                *old = endpoints;
+                true
+            }
+        });
+        Ok(())
+    }
+
+    pub fn status(&self, store: &Store) -> Result<()> {
+        store.write("status.json",&json!({"version":crate::VERSION,"updated_at":time::OffsetDateTime::now_utc().unix_timestamp(),
+            "online":self.fresh(),"interface":self.config.interface,"addresses":self.map.node.as_ref().map(|node| &node.addresses),
+            "peers":self.peers.len(),"direct_peers":self.peers.values().filter(|peer| peer.direct.is_some_and(|(_,seen)| seen.elapsed() < Duration::from_secs(25))).count(),
+            "bytes_received":self.received_bytes,"bytes_sent":self.sent_bytes,"advertised_routes":self.config.advertise_routes}))
+    }
+
+    pub async fn stop(&mut self) -> Result<()> {
+        self.last_map = None;
+        self.peers.clear();
+        self.hub = Hub::default();
+        self.routes.stop(&self.config.interface).await
+    }
+}

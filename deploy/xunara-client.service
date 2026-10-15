@@ -1,0 +1,30 @@
+[Unit]
+Description=Xunara minimal Rust network client
+Documentation=https://github.com/xunara-net/xunara-client
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/xunara-client run --config /etc/xunara-client/config.json
+Restart=on-failure
+RestartSec=5
+StateDirectory=xunara-client
+StateDirectoryMode=0700
+UMask=0077
+NoNewPrivileges=true
+CapabilityBoundingSet=CAP_NET_ADMIN
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
+RestrictSUIDSGID=true
+LockPersonality=true
+DevicePolicy=closed
+DeviceAllow=/dev/net/tun rw
+TimeoutStopSec=15
+
+[Install]
+WantedBy=multi-user.target

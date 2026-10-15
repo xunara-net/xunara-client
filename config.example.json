@@ -1,0 +1,11 @@
+{
+  "server": "https://fakeop4.onbed.cn:9090",
+  "state_dir": "/var/lib/xunara-client",
+  "hostname": "linux-router",
+  "interface": "xunara0",
+  "listen": "0.0.0.0:41641",
+  "mtu": 1280,
+  "advertise_routes": [],
+  "accept_routes": false,
+  "snat": false
+}

@@ -1,0 +1,228 @@
+package main
+
+import (
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"flag"
+	"fmt"
+	"io"
+	"log"
+	"log/slog"
+	"net"
+	"net/http"
+	"net/http/httptest"
+	"net/netip"
+	"os"
+	"os/signal"
+	"path/filepath"
+	"strings"
+	"syscall"
+	"time"
+
+	"github.com/xunara-net/xunara-server/control"
+	"github.com/xunara-net/xunara-server/identity"
+	"github.com/xunara-net/xunara-server/state"
+	"tailscale.com/derp/derpserver"
+	"tailscale.com/net/stun"
+	"tailscale.com/tailcfg"
+	"tailscale.com/tsnet"
+	"tailscale.com/types/key"
+	"tailscale.com/types/logger"
+)
+
+func main() {
+	mode := flag.String("mode", "fixture", "fixture | proxy | http | official | stun-vector")
+	directory := flag.String("dir", "", "private test directory")
+	listen := flag.String("listen", "127.0.0.1:18080", "test listen address")
+	target := flag.String("target", "", "test proxy/HTTP target")
+	flag.Parse()
+	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer cancel()
+	var err error
+	switch *mode {
+	case "proxy":
+		err = proxy(ctx, *listen, *target)
+	case "http":
+		server := &http.Server{Addr: *listen, Handler: http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+			fmt.Fprintln(writer, "xunara-core-ok")
+		}), ReadHeaderTimeout: 3 * time.Second}
+		go func() { <-ctx.Done(); server.Close() }()
+		err = server.ListenAndServe()
+	case "official":
+		err = official(ctx, *directory, *target)
+	case "stun-vector":
+		packet, readErr := hex.DecodeString(*target)
+		if readErr != nil {
+			err = readErr
+			break
+		}
+		_, err = stun.ParseBindingRequest(packet)
+	case "fixture":
+		err = fixture(ctx, *directory)
+	default:
+		err = errors.New("unknown test mode")
+	}
+	if err != nil && ctx.Err() == nil {
+		log.Fatal(err)
+	}
+}
+
+func proxy(ctx context.Context, listen, target string) error {
+	listener, err := net.Listen("tcp", listen)
+	if err != nil {
+		return err
+	}
+	defer listener.Close()
+	go func() { <-ctx.Done(); listener.Close() }()
+	for {
+		incoming, err := listener.Accept()
+		if err != nil {
+			return err
+		}
+		go func() {
+			defer incoming.Close()
+			outgoing, err := (&net.Dialer{Timeout: 5 * time.Second}).DialContext(ctx, "tcp", target)
+			if err != nil {
+				return
+			}
+			defer outgoing.Close()
+			done := make(chan struct{})
+			go func() { io.Copy(outgoing, incoming); outgoing.Close(); close(done) }()
+			io.Copy(incoming, outgoing)
+			incoming.Close()
+			<-done
+		}()
+	}
+}
+
+func fixture(ctx context.Context, directory string) error {
+	if directory == "" {
+		return errors.New("private test directory required")
+	}
+	if err := os.MkdirAll(directory, 0o700); err != nil {
+		return err
+	}
+	derp := derpserver.New(key.NewNode(), logger.Discard)
+	defer derp.Close()
+	derpHTTP := httptest.NewUnstartedServer(derpserver.Handler(derp))
+	derpHTTP.Listener.Close()
+	listener, err := net.Listen("tcp", "0.0.0.0:8081")
+	if err != nil {
+		return err
+	}
+	derpHTTP.Listener = listener
+	derpHTTP.StartTLS()
+	defer derpHTTP.Close()
+	digest := sha256.Sum256(derpHTTP.Certificate().Raw)
+	derpMap := &tailcfg.DERPMap{Regions: map[tailcfg.DERPRegionID]*tailcfg.DERPRegion{900: {
+		RegionID: 900, RegionCode: "test", RegionName: "isolated core test", Nodes: []*tailcfg.DERPNode{{
+			Name: "900a", RegionID: 900, HostName: "127.0.0.1", IPv4: "127.0.0.1", IPv6: "none",
+			DERPPort: 18081, STUNPort: -1, CertName: "sha256-raw:" + hex.EncodeToString(digest[:]),
+		}},
+	}}}
+	policy := filepath.Join(directory, "policy.hujson")
+	if err := os.WriteFile(policy, []byte(`{"acls":[{"action":"accept","src":["*"],"proto":"tcp","dst":["*:8088"]},{"action":"accept","src":["*"],"proto":"icmp","dst":["*:*"]}]}`), 0o600); err != nil {
+		return err
+	}
+	server, err := control.New(control.Config{ServerURL: "http://127.0.0.1:18080", StateDir: filepath.Join(directory, "server"), Domain: "core.test", DERPMap: derpMap, PolicyPath: policy, Logger: slog.New(slog.NewTextHandler(io.Discard, nil))})
+	if err != nil {
+		return err
+	}
+	defer server.Close()
+	if err := server.SetAddressPrefix(netip.MustParsePrefix("100.80.0.0/24")); err != nil {
+		return err
+	}
+	server.Start(ctx)
+	secret, err := state.NewPreAuthKeySecret()
+	if err != nil {
+		return err
+	}
+	credential := state.PreAuthKey{Key: secret, UserID: state.DefaultUserID, Reusable: true, Expiry: time.Now().Add(time.Hour)}
+	if err := server.Store().CreatePreAuthKey(&credential); err != nil {
+		return err
+	}
+	if err := os.WriteFile(filepath.Join(directory, "auth-key"), []byte(secret), 0o600); err != nil {
+		return err
+	}
+	_, token, err := server.Identity().CreateAPIKey(identity.NewAPIKeyOptions{Name: "isolated fixture", UserID: state.DefaultUserID, Scopes: []string{identity.ScopeRead, identity.ScopeWrite}, TTL: time.Hour})
+	if err != nil {
+		return err
+	}
+	mux := http.NewServeMux()
+	mux.HandleFunc("/_test/node", func(writer http.ResponseWriter, request *http.Request) {
+		for _, node := range server.Store().ListNodes() {
+			if node.Hostname == request.URL.Query().Get("host") {
+				json.NewEncoder(writer).Encode(map[string]string{"ipv4": node.IPv4.String(), "ipv6": node.IPv6.String(), "id": node.StableID})
+				return
+			}
+		}
+		http.NotFound(writer, request)
+	})
+	mux.HandleFunc("/_test/approve", func(writer http.ResponseWriter, request *http.Request) {
+		for _, node := range server.Store().ListNodes() {
+			if node.Hostname != "rust-router" {
+				continue
+			}
+			body, _ := json.Marshal(map[string][]string{"approve": {"192.168.90.0/24"}})
+			action := httptest.NewRequest(http.MethodPost, "/api/v1/machines/"+node.StableID+"/routes", strings.NewReader(string(body)))
+			action.Header.Set("Authorization", "Bearer "+token)
+			action.Header.Set("Content-Type", "application/json")
+			server.Handler().ServeHTTP(writer, action)
+			return
+		}
+		http.NotFound(writer, request)
+	})
+	mux.Handle("/", server.Handler())
+	httpServer := &http.Server{Addr: "0.0.0.0:8080", Handler: mux, ReadHeaderTimeout: 5 * time.Second}
+	go func() { <-ctx.Done(); httpServer.Close() }()
+	return httpServer.ListenAndServe()
+}
+
+func official(ctx context.Context, directory, target string) error {
+	secret, err := os.ReadFile(filepath.Join(directory, "auth-key"))
+	if err != nil {
+		return err
+	}
+	server := &tsnet.Server{Dir: filepath.Join(directory, "official"), Hostname: "official-peer", ControlURL: "http://127.0.0.1:18080", AuthKey: strings.TrimSpace(string(secret)), Logf: logger.Discard, UserLogf: logger.Discard}
+	defer server.Close()
+	up, cancel := context.WithTimeout(ctx, 90*time.Second)
+	defer cancel()
+	if _, err := server.Up(up); err != nil {
+		return err
+	}
+	listener, err := server.Listen("tcp", ":8088")
+	if err != nil {
+		return err
+	}
+	defer listener.Close()
+	go http.Serve(listener, http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) { fmt.Fprintln(writer, "official-core-ok") }))
+	if target != "" {
+		client := server.HTTPClient()
+		client.Timeout = 5 * time.Second
+		var success bool
+		for attempt := 0; attempt < 30; attempt++ {
+			request, _ := http.NewRequestWithContext(ctx, http.MethodGet, "http://"+target+":8088", nil)
+			response, err := client.Do(request)
+			if err == nil {
+				content, _ := io.ReadAll(io.LimitReader(response.Body, 100))
+				response.Body.Close()
+				if string(content) == "xunara-core-ok\n" {
+					success = true
+					break
+				}
+			}
+			time.Sleep(time.Second)
+		}
+		if !success {
+			return errors.New("official client could not reach Rust node")
+		}
+		if err := os.WriteFile(filepath.Join(directory, "official-ok"), []byte("pass\n"), 0o600); err != nil {
+			return err
+		}
+	}
+	<-ctx.Done()
+	return nil
+}

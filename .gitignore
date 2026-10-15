@@ -1,0 +1,6 @@
+/target/
+/dist/
+*.key
+*.pem
+/state/
+/config.json
