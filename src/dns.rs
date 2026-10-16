@@ -112,7 +112,7 @@ impl DnsPlan {
             }
         }
         for record in &map.dns.extra_records {
-            if !record.record_type.is_empty() {
+            if !matches!(record.record_type.as_str(), "" | "A" | "AAAA") {
                 continue;
             }
             if let Ok(address) = record.value.parse::<IpAddr>() {
@@ -320,7 +320,7 @@ mod tests {
         let mut map = NetworkMap::default();
         map.apply(json!({"Node":{"ID":1,"Key":"own","Name":"phone.mesh.test.","MachineAuthorized":true,"Addresses":["100.80.0.1/32"]},
             "Peers":[{"ID":2,"Key":"peer","Name":"nas.mesh.test.","MachineAuthorized":true,"Addresses":["100.80.0.2/32","fd7a:115c:a1e0::2/128"]}],
-            "DNSConfig":{"Proxied":true,"Domains":["mesh.test"],"Routes":{"office.test":[{"Addr":"10.77.0.1:5353"}]},"Resolvers":[{"Addr":"9.9.9.9"}],"ExtraRecords":[{"Name":"extra.mesh.test","Value":"10.0.0.5"}]}})).unwrap();
+            "DNSConfig":{"Proxied":true,"Domains":["mesh.test"],"Routes":{"office.test":[{"Addr":"10.77.0.1:5353"}]},"Resolvers":[{"Addr":"9.9.9.9"}],"ExtraRecords":[{"Name":"extra.mesh.test","Type":"A","Value":"10.0.0.5"},{"Name":"extra6.mesh.test","Type":"AAAA","Value":"fd7a:115c:a1e0::5"}]}})).unwrap();
         map
     }
     fn ask(name: &str, kind: RecordType) -> Message {
@@ -353,6 +353,7 @@ mod tests {
             ("nas.mesh.test", RecordType::AAAA),
             ("2.0.80.100.in-addr.arpa", RecordType::PTR),
             ("extra.mesh.test", RecordType::A),
+            ("extra6.mesh.test", RecordType::AAAA),
         ] {
             let Answer::Local(response) = plan.answer(&ask(name, kind)) else {
                 panic!("must resolve locally")
