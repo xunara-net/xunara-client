@@ -53,6 +53,10 @@ func main() {
 		err = server.ListenAndServe()
 	case "official":
 		err = official(ctx, *directory, *target)
+	case "exit":
+		err = officialExit(ctx, *directory)
+	case "dns":
+		err = dnsFixture(ctx, *listen)
 	case "stun-vector":
 		packet, readErr := hex.DecodeString(*target)
 		if readErr != nil {
@@ -124,10 +128,10 @@ func fixture(ctx context.Context, directory string) error {
 		}},
 	}}}
 	policy := filepath.Join(directory, "policy.hujson")
-	if err := os.WriteFile(policy, []byte(`{"acls":[{"action":"accept","src":["*"],"proto":"tcp","dst":["*:8088"]},{"action":"accept","src":["*"],"proto":"icmp","dst":["*:*"]}]}`), 0o600); err != nil {
+	if err := os.WriteFile(policy, []byte(`{"acls":[{"action":"accept","src":["*"],"proto":"tcp","dst":["*:8088","*:5353"]},{"action":"accept","src":["*"],"proto":"udp","dst":["*:5353"]},{"action":"accept","src":["*"],"proto":"icmp","dst":["*:*"]}]}`), 0o600); err != nil {
 		return err
 	}
-	server, err := control.New(control.Config{ServerURL: "http://127.0.0.1:18080", StateDir: filepath.Join(directory, "server"), Domain: "core.test", DERPMap: derpMap, PolicyPath: policy, Logger: slog.New(slog.NewTextHandler(io.Discard, nil))})
+	server, err := control.New(control.Config{ServerURL: "http://127.0.0.1:18080", StateDir: filepath.Join(directory, "server"), Domain: "core.test", Nameservers: []string{"192.168.90.2:5353"}, DERPMap: derpMap, PolicyPath: policy, Logger: slog.New(slog.NewTextHandler(io.Discard, nil))})
 	if err != nil {
 		return err
 	}
@@ -147,6 +151,21 @@ func fixture(ctx context.Context, directory string) error {
 	if err := os.WriteFile(filepath.Join(directory, "auth-key"), []byte(secret), 0o600); err != nil {
 		return err
 	}
+	second := identity.User{LoginName: "second-account", Role: identity.RoleMember}
+	if err := server.Identity().CreateUser(&second); err != nil {
+		return err
+	}
+	secondSecret, err := state.NewPreAuthKeySecret()
+	if err != nil {
+		return err
+	}
+	secondKey := state.PreAuthKey{Key: secondSecret, UserID: second.ID, Reusable: true, Expiry: time.Now().Add(time.Hour)}
+	if err := server.Store().CreatePreAuthKey(&secondKey); err != nil {
+		return err
+	}
+	if err := os.WriteFile(filepath.Join(directory, "second-auth-key"), []byte(secondSecret), 0o600); err != nil {
+		return err
+	}
 	_, token, err := server.Identity().CreateAPIKey(identity.NewAPIKeyOptions{Name: "isolated fixture", UserID: state.DefaultUserID, Scopes: []string{identity.ScopeRead, identity.ScopeWrite}, TTL: time.Hour})
 	if err != nil {
 		return err
@@ -155,7 +174,7 @@ func fixture(ctx context.Context, directory string) error {
 	mux.HandleFunc("/_test/node", func(writer http.ResponseWriter, request *http.Request) {
 		for _, node := range server.Store().ListNodes() {
 			if node.Hostname == request.URL.Query().Get("host") {
-				json.NewEncoder(writer).Encode(map[string]string{"ipv4": node.IPv4.String(), "ipv6": node.IPv6.String(), "id": node.StableID})
+				json.NewEncoder(writer).Encode(map[string]string{"ipv4": node.IPv4.String(), "ipv6": node.IPv6.String(), "id": node.StableID, "user": fmt.Sprint(node.UserID)})
 				return
 			}
 		}
@@ -176,6 +195,27 @@ func fixture(ctx context.Context, directory string) error {
 		http.NotFound(writer, request)
 	})
 	mux.Handle("/", server.Handler())
+	mux.HandleFunc("/_test/exit", func(writer http.ResponseWriter, request *http.Request) {
+		if request.Method != http.MethodPost {
+			writer.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+		for _, node := range server.Store().ListNodes() {
+			if node.Hostname != "official-exit" {
+				continue
+			}
+			body, _ := json.Marshal(map[string][]string{"approve": {"0.0.0.0/0", "::/0"}})
+			if request.URL.Query().Get("revoke") == "1" {
+				body, _ = json.Marshal(map[string][]string{"unapprove": {"0.0.0.0/0", "::/0"}})
+			}
+			action := httptest.NewRequest(http.MethodPost, "/api/v1/machines/"+node.StableID+"/routes", strings.NewReader(string(body)))
+			action.Header.Set("Authorization", "Bearer "+token)
+			action.Header.Set("Content-Type", "application/json")
+			server.Handler().ServeHTTP(writer, action)
+			return
+		}
+		http.NotFound(writer, request)
+	})
 	httpServer := &http.Server{Addr: "0.0.0.0:8080", Handler: mux, ReadHeaderTimeout: 5 * time.Second}
 	go func() { <-ctx.Done(); httpServer.Close() }()
 	return httpServer.ListenAndServe()

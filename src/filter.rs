@@ -228,9 +228,7 @@ impl Filter {
     }
 
     pub fn incoming(&mut self, packet: Packet) -> bool {
-        self.responses
-            .get(&packet)
-            .is_some_and(|expiry| *expiry > Instant::now())
+        self.established(packet)
             || self.rules.iter().any(|rule| {
                 rule.protocols.contains(&packet.protocol)
                     && rule
@@ -244,6 +242,12 @@ impl Filter {
                                     && packet.destination_port <= destination.last))
                     })
             })
+    }
+
+    pub fn established(&self, packet: Packet) -> bool {
+        self.responses
+            .get(&packet)
+            .is_some_and(|expiry| *expiry > Instant::now())
     }
 }
 

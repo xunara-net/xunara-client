@@ -22,6 +22,7 @@ use crate::{
     derp::{Hub, Received},
     diagnostic::{PingRequest, Pings},
     discovery,
+    dns_stack::DnsProxy,
     filter::{Filter, Packet},
     model::{NetworkMap, Node},
     network::{self, Routes, Tun},
@@ -84,24 +85,32 @@ impl Peer {
             .collect()
     }
 
-    fn source_allowed(&self, packet: Packet) -> bool {
+    fn source_allowed(&self, packet: Packet, exit: bool) -> bool {
         self.node
             .addresses
             .iter()
             .chain(&self.node.allowed_ips)
-            .any(|network| network.prefix_len() > 0 && network.contains(&packet.source))
+            .any(|network| {
+                (network.prefix_len() > 0 || (exit && self.node.exit_node()))
+                    && network.contains(&packet.source)
+            })
     }
 
-    fn prefix(&self, packet: Packet, accept_routes: bool) -> Option<u8> {
+    fn prefix(&self, packet: Packet, accept_routes: bool, exit: bool) -> Option<u8> {
         self.node
             .addresses
             .iter()
-            .chain(if accept_routes {
+            .chain(if accept_routes || exit {
                 self.node.allowed_ips.iter()
             } else {
                 [].iter()
             })
-            .filter(|network| network.prefix_len() > 0 && network.contains(&packet.destination))
+            .filter(|network| {
+                (network.prefix_len() > 0 && accept_routes
+                    || network.prefix_len() == 0 && exit && self.node.exit_node()
+                    || self.node.addresses.contains(network))
+                    && network.contains(&packet.destination)
+            })
             .map(IpNet::prefix_len)
             .max()
     }
@@ -132,6 +141,7 @@ pub struct Engine {
     budget: u32,
     diagnostic_input: Option<mpsc::Receiver<PingRequest>>,
     pings: Pings,
+    dns: Option<DnsProxy>,
 }
 
 impl Engine {
@@ -180,6 +190,7 @@ impl Engine {
             budget: 100,
             diagnostic_input: None,
             pings: Pings::default(),
+            dns: None,
         })
     }
 
@@ -191,6 +202,7 @@ impl Engine {
         let mut udp = vec![0; 65568];
         let mut packet = vec![0; 65536];
         let mut ticker = tokio::time::interval(Duration::from_secs(1));
+        let mut dns_ticker = tokio::time::interval(Duration::from_millis(20));
         loop {
             enum Event {
                 Map(Option<Box<NetworkMap>>),
@@ -199,6 +211,7 @@ impl Engine {
                 Derp(Option<Received>),
                 Ping(Option<PingRequest>),
                 Tick,
+                Dns,
             }
             let event = tokio::select! {
                 map = maps.recv() => Event::Map(map.map(Box::new)),
@@ -212,6 +225,7 @@ impl Engine {
                     }
                 } => Event::Ping(request),
                 _ = ticker.tick() => Event::Tick,
+                _ = async { if self.dns.is_some() {dns_ticker.tick().await;} else {std::future::pending::<()>().await;} } => Event::Dns,
             };
             match event {
                 Event::Map(map) => {
@@ -248,6 +262,7 @@ impl Engine {
                         self.status(store)?;
                     }
                 }
+                Event::Dns => self.poll_dns().await?,
             }
         }
     }
@@ -265,6 +280,15 @@ impl Engine {
             "本机映射密钥不匹配或未授权"
         );
         let nodes = map.nodes()?;
+        let stable_ids = nodes
+            .iter()
+            .filter(|node| !node.stable_id.is_empty())
+            .map(|node| &node.stable_id)
+            .collect::<Vec<_>>();
+        ensure!(
+            stable_ids.iter().collect::<BTreeSet<_>>().len() == stable_ids.len(),
+            "网络映射含重复 StableID，拒绝不明确的出口身份"
+        );
         let keys = nodes
             .iter()
             .filter(|node| node.valid())
@@ -276,6 +300,19 @@ impl Engine {
             "网络映射含重复或本机 peer key"
         );
         let filter = Filter::compile(&map.filter)?;
+        #[cfg(target_os = "android")]
+        {
+            let host = crate::mobile::host()?;
+            let plan = crate::dns::DnsPlan::new(
+                &self.config,
+                &map,
+                &host.local_networks()?,
+                &host.dns_servers()?,
+            )?;
+            if self.dns.as_ref().map(DnsProxy::plan) != plan.as_ref() {
+                self.dns = plan.map(DnsProxy::new).transpose()?;
+            }
+        }
         self.routes.apply(&self.config, &map).await?;
         #[cfg(target_os = "android")]
         self.tun.install(self.routes.take_descriptor())?;
@@ -358,13 +395,25 @@ impl Engine {
         if !self.routes.local_source(packet.source) {
             return Ok(());
         }
+        if let Some(dns) = self.dns.as_mut().filter(|dns| dns.local(bytes)) {
+            dns.ingest(bytes);
+            return Ok(());
+        }
+        if !self.routes.remote_destination(packet.destination) {
+            return Ok(());
+        }
         let selected = self
             .peers
             .iter()
             .filter(|(_, peer)| peer.node.valid())
             .filter_map(|(identity, peer)| {
-                peer.prefix(packet, self.config.accept_routes)
-                    .map(|prefix| (*identity, prefix))
+                peer.prefix(
+                    packet,
+                    self.config.accept_routes,
+                    !self.config.exit_node_id.is_empty()
+                        && self.config.exit_node_id == peer.node.stable_id,
+                )
+                .map(|prefix| (*identity, prefix))
             })
             .max_by_key(|(_, prefix)| *prefix)
             .map(|(identity, _)| identity);
@@ -383,6 +432,23 @@ impl Engine {
         );
         if let Output::Wire(bytes) = action {
             self.transmit(selected, None, &bytes).await;
+        }
+        Ok(())
+    }
+
+    async fn poll_dns(&mut self) -> Result<()> {
+        let packets = self.dns.as_mut().map(DnsProxy::poll).unwrap_or_default();
+        if !self.fresh() {
+            return Ok(());
+        }
+        for bytes in packets {
+            if let Some(packet) = Packet::parse(&bytes) {
+                if self.routes.local_destination(packet.destination) {
+                    self.tun.write(&bytes).await?;
+                } else {
+                    self.outgoing(&bytes).await?;
+                }
+            }
         }
         Ok(())
     }
@@ -512,13 +578,13 @@ impl Engine {
                 Path::Udp(address) => Some(address.ip()),
                 Path::Derp(_) => None,
             };
-            let action = Output::from(
-                self.peers
-                    .get_mut(&identity)
-                    .context("peer 丢失")?
-                    .tunnel
-                    .decapsulate(source, bytes, &mut scratch),
-            );
+            let result = self
+                .peers
+                .get_mut(&identity)
+                .context("peer 丢失")?
+                .tunnel
+                .decapsulate(source, bytes, &mut scratch);
+            let action = Output::from(result);
             if matches!(action, Output::Invalid) {
                 continue;
             }
@@ -556,10 +622,13 @@ impl Engine {
             Output::Wire(bytes) => self.transmit(identity, Some(path), &bytes).await,
             Output::Plain(bytes) => {
                 if let Some(packet) = Packet::parse(&bytes)
-                    && self
-                        .peers
-                        .get(&identity)
-                        .is_some_and(|peer| peer.source_allowed(packet))
+                    && self.peers.get(&identity).is_some_and(|peer| {
+                        peer.source_allowed(
+                            packet,
+                            !self.config.exit_node_id.is_empty()
+                                && self.config.exit_node_id == peer.node.stable_id,
+                        )
+                    })
                     && !self.peers.iter().any(|(other, peer)| {
                         *other != identity
                             && peer
@@ -569,13 +638,31 @@ impl Engine {
                                 .any(|address| address.contains(&packet.source))
                     })
                     && self.routes.local_destination(packet.destination)
-                    && self.filter.incoming(packet)
+                    && if self.peers[&identity]
+                        .node
+                        .addresses
+                        .iter()
+                        .chain(
+                            self.peers[&identity]
+                                .node
+                                .allowed_ips
+                                .iter()
+                                .filter(|prefix| prefix.prefix_len() > 0),
+                        )
+                        .any(|prefix| prefix.contains(&packet.source))
+                    {
+                        self.filter.incoming(packet)
+                    } else {
+                        self.filter.established(packet)
+                    }
                 {
                     let (path, region) = match path {
                         Path::Udp(_) => ("direct", 0),
                         Path::Derp(region) => ("relay", region),
                     };
-                    if !self.pings.receive(identity, &bytes, path, region) {
+                    if let Some(dns) = self.dns.as_mut().filter(|dns| dns.upstream(&bytes)) {
+                        dns.ingest(&bytes);
+                    } else if !self.pings.receive(identity, &bytes, path, region) {
                         self.tun.write(&bytes).await?;
                     }
                     self.received_bytes += bytes.len() as u64;
@@ -797,9 +884,11 @@ impl Engine {
             "peers":self.peers.len(),"direct_peers":self.peers.values().filter(|peer| peer.direct.is_some_and(|(_,seen)| seen.elapsed() < Duration::from_secs(25))).count(),
             "bytes_received":self.received_bytes,"bytes_sent":self.sent_bytes,"advertised_routes":self.config.advertise_routes,
             "self_name":self.map.node.as_ref().map(|node| &node.name),"key_expiry":self.map.node.as_ref().and_then(|node| node.key_expiry.as_ref()),
-            "dns":{"enabled":self.map.dns.proxied,"domains":self.map.dns.domains},
+            "owner_login":self.map.node.as_ref().and_then(|node|self.map.user_profiles.get(&node.user)).map(|profile|&profile.login_name),
+            "dns":{"enabled":self.map.dns.proxied,"domains":self.map.dns.domains,"active":self.fresh() && self.dns.is_some(),"address":self.dns.as_ref().map(|dns|dns.plan().address)},
+            "exit_node":{"selected_id":self.config.exit_node_id,"available":self.fresh() && !self.config.exit_node_id.is_empty() && self.peers.values().any(|peer|peer.node.stable_id==self.config.exit_node_id && peer.node.exit_node())},
             "devices":self.peers.values().map(|peer| json!({"id":peer.node.id.to_string(),"name":peer.node.name,"addresses":peer.node.addresses,
-                "os":peer.node.hostinfo.as_ref().map(|hostinfo| &hostinfo.os),"key_expiry":peer.node.key_expiry,
+                "os":peer.node.hostinfo.as_ref().map(|hostinfo| &hostinfo.os),"key_expiry":peer.node.key_expiry,"stable_id":peer.node.stable_id,"exit_node":peer.node.exit_node(),
                 "routes":peer.node.allowed_ips.iter().filter(|prefix| prefix.prefix_len()>0 && prefix.prefix_len() < if prefix.addr().is_ipv4(){32}else{128}).collect::<Vec<_>>(),
                 "authorized":peer.node.valid(),"path":if peer.direct.is_some_and(|(_,seen)| seen.elapsed()<Duration::from_secs(25)){"direct"}else{"relay"},
                 "relay_name":self.map.derp.regions.get(&peer.node.relay_region()).map(|region| if region.region_name.is_empty(){&region.region_code}else{&region.region_name}),
@@ -809,10 +898,63 @@ impl Engine {
     pub async fn stop(&mut self) -> Result<()> {
         self.last_map = None;
         self.pings = Pings::default();
+        self.dns = None;
         self.peers.clear();
         self.hub = Hub::default();
         #[cfg(target_os = "android")]
         self.tun.close();
         self.routes.stop(&self.config.interface).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn exit() -> Peer {
+        Peer {
+            node: Node {
+                stable_id: "selected-exit".into(),
+                machine_authorized: true,
+                addresses: vec!["100.80.0.2/32".parse().unwrap()],
+                allowed_ips: vec!["0.0.0.0/0".parse().unwrap(), "::/0".parse().unwrap()],
+                ..Node::default()
+            },
+            key: [2; 32],
+            disco: None,
+            tunnel: Tunn::new([1; 32].into(), [2; 32].into(), None, None, 1, None),
+            index: 1,
+            direct: None,
+            probes: VecDeque::new(),
+            extra_endpoints: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn default_routes_and_internet_sources_only_belong_to_selected_authorized_exit() {
+        let mut peer = exit();
+        let packet = Packet {
+            source: "100.80.0.1".parse().unwrap(),
+            destination: "203.0.113.77".parse().unwrap(),
+            protocol: 6,
+            source_port: 50000,
+            destination_port: 443,
+        };
+        assert_eq!(peer.prefix(packet, true, false), None);
+        assert_eq!(peer.prefix(packet, false, true), Some(0));
+        let reply = Packet {
+            source: packet.destination,
+            destination: packet.source,
+            source_port: 443,
+            destination_port: 50000,
+            ..packet
+        };
+        assert!(!peer.source_allowed(reply, false));
+        assert!(peer.source_allowed(reply, true));
+        peer.node.allowed_ips.pop();
+        assert_eq!(peer.prefix(packet, true, true), None);
+        assert!(!peer.source_allowed(reply, true));
+        peer.node.machine_authorized = false;
+        assert!(!peer.node.exit_node());
     }
 }

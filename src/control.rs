@@ -217,7 +217,7 @@ impl Client {
 
 fn hostinfo(config: &Config, region: u16) -> Value {
     json!({"Hostname":config.hostname,"OS":std::env::consts::OS,"IPNVersion":format!("xunara-client/{VERSION}"),
-        "RoutableIPs":config.advertise_routes,"NetInfo":{"PreferredDERP":region}})
+        "RoutableIPs":config.advertise_routes,"ExitNodeID":config.exit_node_id,"NetInfo":{"PreferredDERP":region}})
 }
 
 pub async fn run(
@@ -300,7 +300,13 @@ async fn session(
                         let _ = maps.send(map.clone()).await;
                         bail!("设备已失效、撤销或未授权");
                     }
-                    if home == 0 { home = map.derp.regions.keys().next().copied().unwrap_or(0); }
+                    let preferred=if map.derp.regions.contains_key(&home) {home} else {map.derp.regions.keys().next().copied().unwrap_or(0)};
+                    if home!=preferred {
+                        home=preferred;
+                        // 首张 DERPMap 后立即上报 home，不能让对端等 30 秒或只沿握手回程通信。
+                        let advertised=endpoints.borrow().clone();
+                        client.update_endpoints(config,identity,&advertised,home).await?;
+                    }
                     if maps.send(map.clone()).await.is_err() { return Ok(()); }
                 }
             }

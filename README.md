@@ -4,6 +4,8 @@
 
 本仓库同时提供 Android 的 Rust 数据面适配接口；Flutter 界面与 APK 位于独立 [xunara-android](https://github.com/xunara-net/xunara-android) 仓库，不混入 Linux CLI。
 
+Android 适配层支持显式启用 VPN MagicDNS 和选择出口：DNS UDP/TCP 本地端点、设备 A/AAAA/PTR、IP 解析器与分流、出口 peerapi DNS-over-WireGuard。所选出口撤销后保留 VPN 内的阻断，LAN 优先；默认均关闭。详见 Android 仓库的 `docs/dns-exit-accounts.md`。这些选项不开放给 Linux CLI，不更改 Linux 宿主 DNS 或默认路由。
+
 **这是首版最小实现，不是官方 Tailscale 客户端的完整替代品。** 先在测试网络验证，再部署关键业务。当前外层 UDP 使用 IPv4，隧道处理 IPv4 / IPv6 的 TCP、UDP 和 ICMP；不支持 IP 分片或 IPv6 扩展头。可见节点上限 256。
 
 ## 已实现
@@ -67,7 +69,7 @@ sudo xunara-client status --state-dir /var/lib/xunara-client
 
 ## 暂不支持
 
-本仓库内的 GUI、Windows / macOS、MagicDNS、接管 DNS、Exit Node、Tailnet Lock、跨租户设备共享 / 地址 masquerade、服务发布、SSH、文件传输、UDP Peer Relay、自动升级、内核 WireGuard 后端。子网默认路由 `/0` 明确拒绝。无法理解的网络协议 / 规则不会被解释成放行。
+本仓库内的 GUI、Windows / macOS、Linux 系统 MagicDNS / 默认出口、Tailnet Lock、跨租户设备共享 / 地址 masquerade、服务发布、SSH、文件传输、UDP Peer Relay、自动升级、内核 WireGuard 后端。Linux 广播子网默认路由 `/0` 仍明确拒绝。无法理解的网络协议 / 规则不会被解释成放行。
 
 ## Android 平台接口
 

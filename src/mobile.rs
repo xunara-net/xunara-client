@@ -17,6 +17,9 @@ pub trait Host: Send + Sync {
     fn configure(&self, configuration: &VpnConfiguration) -> Result<OwnedFd>;
     fn local_networks(&self) -> Result<Vec<IpNet>>;
     fn local_endpoints(&self, port: u16) -> Vec<String>;
+    fn dns_servers(&self) -> Result<Vec<std::net::IpAddr>> {
+        Ok(Vec::new())
+    }
     fn event(&self, value: &Value);
 }
 
@@ -55,6 +58,8 @@ pub struct VpnConfiguration {
     pub routes: Vec<IpNet>,
     pub skipped_routes: Vec<IpNet>,
     pub mtu: u16,
+    pub dns_servers: Vec<std::net::IpAddr>,
+    pub search_domains: Vec<String>,
 }
 
 impl VpnConfiguration {
@@ -103,16 +108,67 @@ impl VpnConfiguration {
             .copied()
             .collect();
         routes.retain(|route| !overlaps_any(*route, local));
-        // 即使暂时没有其他设备，仍只安装本机 host route，不接管默认出口和 DNS。
+        // 显式选定出口后始终保留接管路由；出口撤销/离线不能静默泄露到本地公网。
+        if !config.exit_node_id.is_empty() {
+            let mut excluded = local.to_vec();
+            excluded.extend(
+                [
+                    "0.0.0.0/8",
+                    "127.0.0.0/8",
+                    "169.254.0.0/16",
+                    "224.0.0.0/4",
+                    "::1/128",
+                    "fe80::/10",
+                    "ff00::/8",
+                ]
+                .into_iter()
+                .map(|prefix| prefix.parse::<IpNet>().expect("constant prefix")),
+            );
+            for default in ["0.0.0.0/0", "::/0"] {
+                let mut remaining = vec![default.parse::<IpNet>()?];
+                for exclusion in &excluded {
+                    remaining = remaining
+                        .into_iter()
+                        .flat_map(|route| subtract(route, *exclusion))
+                        .collect();
+                    ensure!(remaining.len() <= 4096, "出口排除路由超过上限");
+                }
+                routes.extend(remaining);
+            }
+        }
         routes.extend(addresses.iter().copied());
+        let dns = crate::dns::DnsPlan::new(config, map, local, &[])?;
+        if let Some(address) = dns.as_ref().map(|dns| dns.address) {
+            routes.insert(address.into());
+        }
         ensure!(routes.len() <= 4096, "移动端路由超过上限");
         Ok(Self {
             addresses: addresses.into_iter().collect(),
             routes: routes.into_iter().collect(),
             skipped_routes,
             mtu: config.mtu,
+            dns_servers: dns
+                .as_ref()
+                .map(|dns| vec![dns.address])
+                .unwrap_or_default(),
+            search_domains: dns.map(|dns| dns.domains).unwrap_or_default(),
         })
     }
+}
+
+// 在用户态拆分默认路由，兼容 Android 8–12 没有 excludeRoute 的 Builder。
+fn subtract(route: IpNet, excluded: IpNet) -> Vec<IpNet> {
+    if excluded.prefix_len() <= route.prefix_len() && excluded.contains(&route.addr()) {
+        return Vec::new();
+    }
+    if !route.contains(&excluded.addr()) {
+        return vec![route];
+    }
+    route
+        .subnets(route.prefix_len() + 1)
+        .expect("splittable prefix")
+        .flat_map(|child| subtract(child, excluded))
+        .collect()
 }
 
 fn overlaps_any(route: IpNet, networks: &[IpNet]) -> bool {
@@ -191,5 +247,42 @@ mod tests {
             ..Config::default()
         };
         assert!(VpnConfiguration::from_map(&config, &self::map(), &[]).is_err());
+    }
+
+    #[test]
+    fn exit_preserves_lan_and_keeps_blackhole_when_peer_is_removed() {
+        let config = Config {
+            exit_node_id: "exit-stable".into(),
+            ..Config::default()
+        };
+        let local = vec!["192.168.8.0/24".parse().unwrap()];
+        let mut map = map();
+        let before = VpnConfiguration::from_map(&config, &map, &local).unwrap();
+        assert!(
+            before
+                .routes
+                .iter()
+                .any(|route| route.contains(&"1.1.1.1".parse::<std::net::IpAddr>().unwrap()))
+        );
+        assert!(
+            before.routes.iter().any(
+                |route| route.contains(&"2606:4700::1111".parse::<std::net::IpAddr>().unwrap())
+            )
+        );
+        assert!(
+            !before
+                .routes
+                .iter()
+                .any(|route| route.contains(&"192.168.8.2".parse::<std::net::IpAddr>().unwrap()))
+        );
+        assert_eq!(before.dns_servers.len(), 1);
+        map.peers.clear();
+        let after = VpnConfiguration::from_map(&config, &map, &local).unwrap();
+        assert!(
+            after
+                .routes
+                .iter()
+                .any(|route| route.contains(&"1.1.1.1".parse::<std::net::IpAddr>().unwrap()))
+        );
     }
 }

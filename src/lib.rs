@@ -5,6 +5,8 @@ pub mod control;
 pub mod derp;
 pub mod diagnostic;
 pub mod discovery;
+pub mod dns;
+pub mod dns_stack;
 pub mod engine;
 pub mod filter;
 pub mod mobile;

@@ -3,7 +3,7 @@
 - 本仓库只负责组网数据面与必要的控制客户端；禁止重新混入 GUI、账号中心、计费、文件传输或 Go sidecar。
 - 保持官方 TS2021 / Noise / WireGuard / Disco / STUN / DERP 兼容。先查 symbol、调用链、上游与测试，再改协议；不能为了体积省掉认证、ACL 或来源校验。
 - Machine / Node / Disco 私钥与人类账号 Session 分离。秘密只能从受保护文件读取，禁止 URL、argv、日志或 Git 泄露。
-- 路由只 add 本程序自己的项；不覆盖已有网卡，不修改默认路由、系统 DNS 或全局转发开关。冲突优先保留 LAN。
+- 路由只 add 本程序自己的项；Linux 不覆盖已有网卡，不修改默认路由、系统 DNS 或全局转发开关。Android 仅在用户明确开启时使用 VPN 内的 MagicDNS 或指定出口，默认关闭；出口失效不得回退到其他出口或直连，冲突优先保留 LAN。
 - 使用中文注释说明安全边界和必要的 unsafe；不用注释重复代码字面含义。
 - 私有状态必须原子写入、0600 / 0700、持久化且有实例锁；损坏时拒绝覆盖身份。
 - Rust 修改运行 `cargo fmt --check`、`cargo clippy --locked --all-targets -- -D warnings`、`cargo test --locked --all-targets`。

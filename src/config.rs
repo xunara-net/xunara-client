@@ -15,6 +15,8 @@ pub struct Config {
     pub listen: SocketAddr,
     pub advertise_routes: Vec<IpNet>,
     pub accept_routes: bool,
+    pub accept_dns: bool,
+    pub exit_node_id: String,
     pub snat: bool,
     pub mtu: u16,
 }
@@ -29,6 +31,8 @@ impl Default for Config {
             listen: "0.0.0.0:41641".parse().expect("constant socket"),
             advertise_routes: Vec::new(),
             accept_routes: false,
+            accept_dns: false,
+            exit_node_id: String::new(),
             snat: false,
             mtu: 1280,
         }
@@ -45,6 +49,19 @@ impl Config {
 
     pub fn validate(&self) -> Result<()> {
         server_url(&self.server)?;
+        ensure!(
+            self.exit_node_id.len() <= 128
+                && self
+                    .exit_node_id
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-')),
+            "出口节点标识无效"
+        );
+        #[cfg(target_os = "linux")]
+        ensure!(
+            !self.accept_dns && self.exit_node_id.is_empty(),
+            "DNS 与出口选择仅由 Android VPN 管理；Linux 不修改系统 DNS 或默认路由"
+        );
         ensure!(self.state_dir.is_absolute(), "状态目录必须为绝对路径");
         ensure!(
             valid_interface(&self.interface),

@@ -1,0 +1,801 @@
+use std::{
+    collections::{BTreeMap, VecDeque},
+    net::IpAddr,
+    time::{Duration, Instant},
+};
+
+use anyhow::{Context, Result, bail, ensure};
+use hickory_proto::op::{Message, ResponseCode};
+use rand_core::{OsRng, RngCore};
+use smoltcp::{
+    iface::{Config, Interface, SocketHandle, SocketSet},
+    phy::{Device, DeviceCapabilities, Medium, RxToken, TxToken},
+    socket::{tcp, udp},
+    time::{Duration as StackDuration, Instant as StackInstant},
+    wire::{HardwareAddress, IpAddress, IpCidr, IpEndpoint},
+};
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    task::JoinSet,
+};
+
+use crate::{
+    dns::{self, Answer, DnsPlan, Target},
+    filter::Packet,
+};
+
+const LIMIT: usize = 64;
+const TCP_LIMIT: usize = 8;
+const MAX_RESPONSE: usize = 65535;
+
+#[derive(Default)]
+struct Queue {
+    input: VecDeque<Vec<u8>>,
+    output: VecDeque<Vec<u8>>,
+}
+struct Received(Vec<u8>);
+struct Transmit<'a>(&'a mut VecDeque<Vec<u8>>);
+
+impl RxToken for Received {
+    fn consume<Output, Function: FnOnce(&[u8]) -> Output>(self, function: Function) -> Output {
+        function(&self.0)
+    }
+}
+impl TxToken for Transmit<'_> {
+    fn consume<Output, Function: FnOnce(&mut [u8]) -> Output>(
+        self,
+        length: usize,
+        function: Function,
+    ) -> Output {
+        let mut bytes = vec![0; length];
+        let result = function(&mut bytes);
+        self.0.push_back(bytes);
+        result
+    }
+}
+impl Device for Queue {
+    type RxToken<'a> = Received;
+    type TxToken<'a> = Transmit<'a>;
+    fn receive(&mut self, _: StackInstant) -> Option<(Received, Transmit<'_>)> {
+        if self.output.len() >= 256 {
+            return None;
+        }
+        self.input
+            .pop_front()
+            .map(|bytes| (Received(bytes), Transmit(&mut self.output)))
+    }
+    fn transmit(&mut self, _: StackInstant) -> Option<Transmit<'_>> {
+        (self.output.len() < 256).then_some(Transmit(&mut self.output))
+    }
+    fn capabilities(&self) -> DeviceCapabilities {
+        let mut capabilities = DeviceCapabilities::default();
+        capabilities.medium = Medium::Ip;
+        capabilities.max_transmission_unit = 1280;
+        capabilities
+    }
+}
+
+#[derive(Clone)]
+enum Client {
+    Udp(IpEndpoint, usize),
+    Tcp(usize, u64),
+}
+struct Listener {
+    handle: SocketHandle,
+    generation: u64,
+    input: Vec<u8>,
+    output: Vec<u8>,
+    written: usize,
+    busy: bool,
+}
+struct Upstream {
+    handle: SocketHandle,
+    target: Target,
+    input: Vec<u8>,
+    output: Vec<u8>,
+    written: usize,
+    started: Instant,
+}
+struct Pending {
+    client: Client,
+    query: Message,
+    targets: VecDeque<Target>,
+    upstream: Option<Upstream>,
+    direct: bool,
+}
+
+/// 有界 DNS 专用 TCP/IP 端点，不代理应用的任意 TCP 流，也不监听手机物理网卡。
+pub struct DnsProxy {
+    plan: DnsPlan,
+    device: Queue,
+    interface: Interface,
+    sockets: SocketSet<'static>,
+    udp: SocketHandle,
+    listeners: Vec<Listener>,
+    pending: BTreeMap<u64, Pending>,
+    tasks: JoinSet<(u64, Result<Message>)>,
+    next_id: u64,
+    next_port: u16,
+    started: Instant,
+}
+
+impl DnsProxy {
+    pub fn new(plan: DnsPlan) -> Result<Self> {
+        let mut device = Queue::default();
+        let mut config = Config::new(HardwareAddress::Ip);
+        config.random_seed = OsRng.next_u64();
+        let mut interface = Interface::new(config, &mut device, StackInstant::from_millis(0));
+        ensure!(
+            plan.addresses.len() < smoltcp::config::IFACE_MAX_ADDR_COUNT,
+            "DNS 本机地址数量超过端点容量"
+        );
+        ensure!(
+            plan.addresses
+                .iter()
+                .all(|address| !address.is_unspecified()
+                    && !address.is_multicast()
+                    && !address.is_loopback()),
+            "DNS 本机地址无效"
+        );
+        interface.update_ip_addrs(|addresses| {
+            addresses
+                .push(IpCidr::new(
+                    plan.address.into(),
+                    if plan.address.is_ipv4() { 32 } else { 128 },
+                ))
+                .expect("bounded addresses");
+            for address in &plan.addresses {
+                addresses
+                    .push(IpCidr::new(
+                        (*address).into(),
+                        if address.is_ipv4() { 32 } else { 128 },
+                    ))
+                    .expect("bounded addresses");
+            }
+        });
+        interface
+            .routes_mut()
+            .add_default_ipv4_route("100.100.100.100".parse()?)
+            .map_err(|_| anyhow::anyhow!("DNS IPv4 路由已满"))?;
+        interface
+            .routes_mut()
+            .add_default_ipv6_route("fd7a:115c:a1e0::53".parse()?)
+            .map_err(|_| anyhow::anyhow!("DNS IPv6 路由已满"))?;
+        let mut sockets = SocketSet::new(Vec::new());
+        let mut server = udp::Socket::new(
+            udp::PacketBuffer::new(vec![udp::PacketMetadata::EMPTY; 64], vec![0; 65536]),
+            udp::PacketBuffer::new(vec![udp::PacketMetadata::EMPTY; 64], vec![0; 65536]),
+        );
+        server
+            .bind((IpAddress::from(plan.address), 53))
+            .map_err(|_| anyhow::anyhow!("DNS UDP 监听失败"))?;
+        let udp = sockets.add(server);
+        let mut listeners = Vec::new();
+        for _ in 0..TCP_LIMIT {
+            let mut socket = tcp_socket();
+            socket
+                .listen((IpAddress::from(plan.address), 53))
+                .map_err(|_| anyhow::anyhow!("DNS TCP 监听失败"))?;
+            listeners.push(Listener {
+                handle: sockets.add(socket),
+                generation: 0,
+                input: Vec::new(),
+                output: Vec::new(),
+                written: 0,
+                busy: false,
+            });
+        }
+        Ok(Self {
+            plan,
+            device,
+            interface,
+            sockets,
+            udp,
+            listeners,
+            pending: BTreeMap::new(),
+            tasks: JoinSet::new(),
+            next_id: 0,
+            next_port: 49152 + (OsRng.next_u32() % 8192) as u16,
+            started: Instant::now(),
+        })
+    }
+
+    pub fn plan(&self) -> &DnsPlan {
+        &self.plan
+    }
+
+    pub fn local(&self, bytes: &[u8]) -> bool {
+        Packet::parse(bytes).is_some_and(|packet| {
+            packet.destination == self.plan.address
+                && packet.destination_port == 53
+                && matches!(packet.protocol, 6 | 17)
+                && self.plan.addresses.contains(&packet.source)
+        })
+    }
+
+    pub fn upstream(&self, bytes: &[u8]) -> bool {
+        Packet::parse(bytes).is_some_and(|packet| {
+            packet.protocol == 6
+                && self.pending.values().any(|pending| {
+                    pending.upstream.as_ref().is_some_and(|upstream| {
+                        let socket = self.sockets.get::<tcp::Socket>(upstream.handle);
+                        socket.remote_endpoint().is_some_and(|remote| {
+                            IpAddr::from(remote.addr) == packet.source
+                                && remote.port == packet.source_port
+                        }) && socket.local_endpoint().is_some_and(|local| {
+                            IpAddr::from(local.addr) == packet.destination
+                                && local.port == packet.destination_port
+                        })
+                    })
+                })
+        })
+    }
+
+    pub fn ingest(&mut self, bytes: &[u8]) {
+        if self.device.input.len() < 256 {
+            self.device.input.push_back(bytes.to_vec());
+        }
+    }
+
+    /// 输出由 Engine 按目的地址分流：DNS 回包写 TUN，上游请求仍走同一 WireGuard/ACL。
+    pub fn poll(&mut self) -> Vec<Vec<u8>> {
+        let now = StackInstant::from_millis(
+            self.started.elapsed().as_millis().min(i64::MAX as u128) as i64,
+        );
+        self.interface
+            .poll(now, &mut self.device, &mut self.sockets);
+        while let Some(Ok((id, response))) = self.tasks.try_join_next() {
+            if let Some(pending) = self.pending.get_mut(&id) {
+                pending.direct = false;
+            }
+            if let Ok(response) = response {
+                self.complete(id, response);
+            }
+        }
+        let mut requests = Vec::new();
+        let socket = self.sockets.get_mut::<udp::Socket>(self.udp);
+        while let Ok((bytes, metadata)) = socket.recv() {
+            if let Ok(query) = dns::query(bytes) {
+                requests.push((
+                    Client::Udp(
+                        metadata.endpoint,
+                        usize::from(query.max_payload()).clamp(512, 1232),
+                    ),
+                    query,
+                ));
+            }
+        }
+        for (index, listener) in self.listeners.iter_mut().enumerate() {
+            let socket = self.sockets.get_mut::<tcp::Socket>(listener.handle);
+            if !socket.is_open() {
+                listener.generation += 1;
+                listener.busy = false;
+                listener.input.clear();
+                listener.output.clear();
+                listener.written = 0;
+                let _ = socket.listen((IpAddress::from(self.plan.address), 53));
+            }
+            if socket.can_recv() {
+                let mut bytes = [0; 4096];
+                while let Ok(length) = socket.recv_slice(&mut bytes) {
+                    if length == 0 {
+                        break;
+                    }
+                    listener.input.extend_from_slice(&bytes[..length]);
+                    if listener.input.len() > 16386 {
+                        socket.abort();
+                        break;
+                    }
+                }
+            }
+            if !listener.output.is_empty() && socket.can_send() {
+                if let Ok(length) = socket.send_slice(&listener.output[listener.written..]) {
+                    listener.written += length;
+                }
+                if listener.written == listener.output.len() {
+                    listener.output.clear();
+                    listener.written = 0;
+                    listener.busy = false;
+                }
+            }
+            if !listener.busy && listener.input.len() >= 2 {
+                let length =
+                    usize::from(u16::from_be_bytes([listener.input[0], listener.input[1]]));
+                if !(12..=16384).contains(&length) {
+                    socket.abort();
+                    continue;
+                }
+                if listener.input.len() >= length + 2 {
+                    let query = dns::query(&listener.input[2..length + 2]);
+                    listener.input.drain(..length + 2);
+                    match query {
+                        Ok(query) => {
+                            listener.busy = true;
+                            requests.push((Client::Tcp(index, listener.generation), query));
+                        }
+                        Err(_) => socket.abort(),
+                    }
+                }
+            }
+            if socket.state() == tcp::State::CloseWait
+                && !listener.busy
+                && listener.output.is_empty()
+            {
+                socket.close();
+            }
+        }
+        for (client, query) in requests {
+            self.request(client, query);
+        }
+        let mut completed = Vec::new();
+        let mut failed = Vec::new();
+        for (id, pending) in &mut self.pending {
+            if let Some(upstream) = &mut pending.upstream {
+                let socket = self.sockets.get_mut::<tcp::Socket>(upstream.handle);
+                if socket.can_send()
+                    && upstream.written < upstream.output.len()
+                    && let Ok(length) = socket.send_slice(&upstream.output[upstream.written..])
+                {
+                    upstream.written += length;
+                }
+                if socket.can_recv() {
+                    let mut bytes = [0; 4096];
+                    while let Ok(length) = socket.recv_slice(&mut bytes) {
+                        if length == 0 {
+                            break;
+                        }
+                        upstream.input.extend_from_slice(&bytes[..length]);
+                        if upstream.input.len() > MAX_RESPONSE + 8192 {
+                            break;
+                        }
+                    }
+                }
+                let response = upstream_response(
+                    &upstream.target,
+                    &upstream.input,
+                    !socket.may_recv()
+                        && !matches!(
+                            socket.state(),
+                            tcp::State::SynSent | tcp::State::SynReceived
+                        ),
+                );
+                match response {
+                    Ok(Some(bytes)) => match dns::verified(&pending.query, &bytes) {
+                        Ok(response) => completed.push((*id, response)),
+                        Err(_) => failed.push(*id),
+                    },
+                    Err(_) => failed.push(*id),
+                    Ok(None) => {
+                        if upstream.started.elapsed() > Duration::from_secs(4) || !socket.is_open()
+                        {
+                            failed.push(*id);
+                        }
+                    }
+                }
+            }
+        }
+        for (id, response) in completed {
+            self.complete(id, response);
+        }
+        for id in failed {
+            self.clear_upstream(id);
+        }
+        let ready = self
+            .pending
+            .iter()
+            .filter(|(_, pending)| !pending.direct && pending.upstream.is_none())
+            .map(|(id, _)| *id)
+            .collect::<Vec<_>>();
+        for id in ready {
+            self.forward(id);
+        }
+        self.interface
+            .poll(now, &mut self.device, &mut self.sockets);
+        self.device.output.drain(..).collect()
+    }
+
+    fn request(&mut self, client: Client, query: Message) {
+        match self.plan.answer(&query) {
+            Answer::Local(response) => self.respond(client, &response),
+            Answer::Forward(targets) => {
+                if self.pending.len() >= LIMIT {
+                    self.respond(client, &dns::reply(&query, ResponseCode::ServFail));
+                    return;
+                }
+                self.next_id += 1;
+                self.pending.insert(
+                    self.next_id,
+                    Pending {
+                        client,
+                        query,
+                        targets: targets.into_iter().take(3).collect(),
+                        upstream: None,
+                        direct: false,
+                    },
+                );
+            }
+        }
+    }
+
+    fn forward(&mut self, id: u64) {
+        let Some(pending) = self.pending.get_mut(&id) else {
+            return;
+        };
+        let Some(target) = pending.targets.pop_front() else {
+            let response = dns::reply(&pending.query, ResponseCode::ServFail);
+            self.complete(id, response);
+            return;
+        };
+        if !self.plan.tunneled(&target) {
+            pending.direct = true;
+            let query = pending.query.clone();
+            self.tasks
+                .spawn(async move { (id, direct(&target, &query).await) });
+            return;
+        }
+        let Some(source) = self
+            .plan
+            .addresses
+            .iter()
+            .find(|address| address.is_ipv4() == target.address().is_ipv4())
+        else {
+            return;
+        };
+        let Ok(output) = upstream_request(&target, &pending.query) else {
+            return;
+        };
+        let mut socket = tcp_socket();
+        let local = (IpAddress::from(*source), self.next_port);
+        self.next_port = if self.next_port == 65535 {
+            49152
+        } else {
+            self.next_port + 1
+        };
+        if socket
+            .connect(
+                self.interface.context(),
+                (
+                    IpAddress::from(target.address().ip()),
+                    target.address().port(),
+                ),
+                local,
+            )
+            .is_err()
+        {
+            return;
+        }
+        pending.upstream = Some(Upstream {
+            handle: self.sockets.add(socket),
+            target,
+            input: Vec::new(),
+            output,
+            written: 0,
+            started: Instant::now(),
+        });
+    }
+
+    fn clear_upstream(&mut self, id: u64) {
+        if let Some(upstream) = self
+            .pending
+            .get_mut(&id)
+            .and_then(|pending| pending.upstream.take())
+        {
+            self.sockets.remove(upstream.handle);
+        }
+    }
+    fn complete(&mut self, id: u64, response: Message) {
+        self.clear_upstream(id);
+        if let Some(pending) = self.pending.remove(&id) {
+            self.respond(pending.client, &response);
+        }
+    }
+    fn respond(&mut self, client: Client, response: &Message) {
+        match client {
+            Client::Udp(endpoint, limit) => {
+                if let Ok(bytes) = dns::encode(response, limit) {
+                    let _ = self
+                        .sockets
+                        .get_mut::<udp::Socket>(self.udp)
+                        .send_slice(&bytes, endpoint);
+                }
+            }
+            Client::Tcp(index, generation) => {
+                if let Some(listener) = self
+                    .listeners
+                    .get_mut(index)
+                    .filter(|listener| listener.generation == generation)
+                {
+                    if let Ok(bytes) = dns::encode(response, MAX_RESPONSE) {
+                        listener.output = frame(&bytes);
+                        listener.written = 0;
+                    } else {
+                        self.sockets.get_mut::<tcp::Socket>(listener.handle).abort();
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn tcp_socket() -> tcp::Socket<'static> {
+    let mut socket = tcp::Socket::new(
+        tcp::SocketBuffer::new(vec![0; 32768]),
+        tcp::SocketBuffer::new(vec![0; 32768]),
+    );
+    socket.set_timeout(Some(StackDuration::from_secs(15)));
+    socket.set_ack_delay(None);
+    socket
+}
+fn frame(bytes: &[u8]) -> Vec<u8> {
+    let mut output = (bytes.len() as u16).to_be_bytes().to_vec();
+    output.extend_from_slice(bytes);
+    output
+}
+fn upstream_request(target: &Target, query: &Message) -> Result<Vec<u8>> {
+    let bytes = query.to_vec()?;
+    match target {
+        Target::Dns(_) => Ok(frame(&bytes)),
+        Target::PeerHttp(address) => {
+            let mut output=format!("POST /dns-query HTTP/1.0\r\nHost: {address}\r\nContent-Type: application/dns-message\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",bytes.len()).into_bytes();
+            output.extend(bytes);
+            Ok(output)
+        }
+    }
+}
+fn upstream_response(target: &Target, bytes: &[u8], closed: bool) -> Result<Option<Vec<u8>>> {
+    ensure!(bytes.len() <= MAX_RESPONSE + 8192, "DNS 响应超过上限");
+    match target {
+        Target::Dns(_) => {
+            if bytes.len() < 2 {
+                ensure!(!closed, "DNS 连接提前关闭");
+                return Ok(None);
+            }
+            let length = usize::from(u16::from_be_bytes([bytes[0], bytes[1]]));
+            ensure!(length >= 12, "DNS 响应过短");
+            if bytes.len() >= length + 2 {
+                Ok(Some(bytes[2..length + 2].to_vec()))
+            } else {
+                ensure!(!closed, "DNS 回包不完整");
+                Ok(None)
+            }
+        }
+        Target::PeerHttp(_) => {
+            let mut headers = [httparse::EMPTY_HEADER; 32];
+            let mut response = httparse::Response::new(&mut headers);
+            let httparse::Status::Complete(offset) = response.parse(bytes)? else {
+                ensure!(bytes.len() <= 8192 && !closed, "DNS HTTP 头无效");
+                return Ok(None);
+            };
+            ensure!(response.code == Some(200), "出口 DNS 服务拒绝请求");
+            ensure!(
+                response
+                    .headers
+                    .iter()
+                    .any(|header| header.name.eq_ignore_ascii_case("Content-Type")
+                        && header.value.starts_with(b"application/dns-message")),
+                "出口 DNS 内容类型无效"
+            );
+            ensure!(
+                !response
+                    .headers
+                    .iter()
+                    .any(|header| header.name.eq_ignore_ascii_case("Transfer-Encoding")),
+                "DNS HTTP/1.0 不接受分块响应"
+            );
+            let lengths = response
+                .headers
+                .iter()
+                .filter(|header| header.name.eq_ignore_ascii_case("Content-Length"))
+                .collect::<Vec<_>>();
+            ensure!(lengths.len() <= 1, "出口 DNS 长度头重复");
+            let body = &bytes[offset..];
+            if let Some(header) = lengths.first() {
+                let length = std::str::from_utf8(header.value)?.parse::<usize>()?;
+                ensure!((12..=MAX_RESPONSE).contains(&length), "出口 DNS 长度无效");
+                if body.len() >= length {
+                    return Ok(Some(body[..length].to_vec()));
+                }
+            } else if closed {
+                return Ok(Some(body.to_vec()));
+            }
+            ensure!(!closed, "出口 DNS 回包不完整");
+            Ok(None)
+        }
+    }
+}
+
+async fn direct(target: &Target, query: &Message) -> Result<Message> {
+    let Target::Dns(address) = target else {
+        bail!("出口 DNS 只能走加密隧道");
+    };
+    tokio::time::timeout(Duration::from_secs(3), async {
+        let socket = if address.is_ipv4() {
+            tokio::net::TcpSocket::new_v4()?
+        } else {
+            tokio::net::TcpSocket::new_v6()?
+        };
+        #[cfg(target_os = "android")]
+        {
+            use std::os::fd::AsRawFd;
+            crate::mobile::host()?.protect(socket.as_raw_fd())?;
+        }
+        let mut stream = socket.connect(*address).await?;
+        stream.write_all(&upstream_request(target, query)?).await?;
+        let length = stream.read_u16().await? as usize;
+        ensure!(length >= 12, "DNS 回包过短");
+        let mut bytes = vec![0; length];
+        stream.read_exact(&mut bytes).await?;
+        dns::verified(query, &bytes)
+    })
+    .await
+    .context("DNS 上游查询超时")?
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{config::Config as ClientConfig, model::NetworkMap};
+    use hickory_proto::{
+        op::Query,
+        rr::{Name, RecordType},
+    };
+    use serde_json::json;
+
+    fn proxy() -> DnsProxy {
+        let mut map = NetworkMap::default();
+        map.apply(json!({"Node":{"ID":1,"Name":"phone.mesh.test.","Key":"key","MachineAuthorized":true,"Addresses":["100.80.0.1/32","fd7a:115c:a1e0::1/128"]},
+            "Peers":[{"ID":2,"Name":"nas.mesh.test.","Key":"peer","MachineAuthorized":true,"Addresses":["100.80.0.2/32"]}],
+            "DNSConfig":{"Proxied":true,"Routes":{"mesh.test":null},"Domains":["mesh.test"]}})).unwrap();
+        DnsProxy::new(
+            DnsPlan::new(
+                &ClientConfig {
+                    accept_dns: true,
+                    ..ClientConfig::default()
+                },
+                &map,
+                &[],
+                &[],
+            )
+            .unwrap()
+            .unwrap(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn local_dns_serves_real_udp_and_tcp_packets() {
+        for tcp in [false, true] {
+            let mut server = proxy();
+            let mut device = Queue::default();
+            let mut interface = Interface::new(
+                Config::new(HardwareAddress::Ip),
+                &mut device,
+                StackInstant::from_millis(0),
+            );
+            interface.update_ip_addrs(|addresses| {
+                addresses
+                    .push(IpCidr::new("100.80.0.1".parse().unwrap(), 32))
+                    .unwrap();
+            });
+            interface
+                .routes_mut()
+                .add_default_ipv4_route("100.100.100.100".parse().unwrap())
+                .unwrap();
+            let mut sockets = SocketSet::new(Vec::new());
+            let endpoint = (IpAddress::from(server.plan.address), 53);
+            let handle = if tcp {
+                let mut socket = tcp_socket();
+                socket
+                    .connect(
+                        interface.context(),
+                        endpoint,
+                        ("100.80.0.1".parse::<IpAddress>().unwrap(), 53000),
+                    )
+                    .unwrap();
+                sockets.add(socket)
+            } else {
+                let mut socket = udp::Socket::new(
+                    udp::PacketBuffer::new(vec![udp::PacketMetadata::EMPTY; 4], vec![0; 8192]),
+                    udp::PacketBuffer::new(vec![udp::PacketMetadata::EMPTY; 4], vec![0; 8192]),
+                );
+                socket
+                    .bind(("100.80.0.1".parse::<IpAddress>().unwrap(), 53000))
+                    .unwrap();
+                sockets.add(socket)
+            };
+            let mut query = Message::query();
+            query.queries.push(Query::query(
+                Name::from_ascii("nas.mesh.test.").unwrap(),
+                RecordType::A,
+            ));
+            let bytes = query.to_vec().unwrap();
+            let mut sent = false;
+            let mut received = Vec::new();
+            for tick in 0..200 {
+                if !sent {
+                    if tcp {
+                        let socket = sockets.get_mut::<tcp::Socket>(handle);
+                        if socket.can_send() {
+                            socket.send_slice(&frame(&bytes)).unwrap();
+                            sent = true;
+                        }
+                    } else {
+                        sockets
+                            .get_mut::<udp::Socket>(handle)
+                            .send_slice(&bytes, endpoint)
+                            .unwrap();
+                        sent = true;
+                    }
+                }
+                interface.poll(StackInstant::from_millis(tick), &mut device, &mut sockets);
+                for packet in device.output.drain(..) {
+                    assert!(server.local(&packet));
+                    server.ingest(&packet);
+                }
+                for packet in server.poll() {
+                    device.input.push_back(packet);
+                }
+                if tcp {
+                    let socket = sockets.get_mut::<tcp::Socket>(handle);
+                    let mut bytes = [0; 2048];
+                    if let Ok(length) = socket.recv_slice(&mut bytes) {
+                        received.extend_from_slice(&bytes[..length]);
+                    }
+                } else if let Ok((bytes, _)) = sockets.get_mut::<udp::Socket>(handle).recv() {
+                    received = bytes.to_vec();
+                }
+                let response = if tcp {
+                    upstream_response(
+                        &Target::Dns("100.100.100.100:53".parse().unwrap()),
+                        &received,
+                        false,
+                    )
+                    .unwrap()
+                } else if received.is_empty() {
+                    None
+                } else {
+                    Some(received.clone())
+                };
+                if let Some(bytes) = response {
+                    let response = dns::verified(&query, &bytes).unwrap();
+                    assert_eq!(response.answers.len(), 1);
+                    break;
+                }
+            }
+            assert!(!received.is_empty(), "DNS transport failed: TCP={tcp}");
+        }
+    }
+    #[test]
+    fn tcp_frames_and_exit_http_are_bounded_and_not_redirected() {
+        let target = Target::Dns("100.80.0.2:53".parse().unwrap());
+        let bytes = vec![0; 12];
+        let framed = frame(&bytes);
+        assert!(
+            upstream_response(&target, &framed[..8], false)
+                .unwrap()
+                .is_none()
+        );
+        assert!(upstream_response(&target, &framed[..8], true).is_err());
+        assert_eq!(
+            upstream_response(&target, &framed, false).unwrap().unwrap(),
+            bytes
+        );
+        let target = Target::PeerHttp("100.80.0.2:40000".parse().unwrap());
+        assert!(
+            upstream_response(
+                &target,
+                b"HTTP/1.0 302 Found\r\nLocation: https://evil.invalid\r\n\r\n",
+                true
+            )
+            .is_err()
+        );
+        let mut response=b"HTTP/1.0 200 OK\r\nContent-Type: application/dns-message\r\nContent-Length: 12\r\n\r\n".to_vec();
+        response.extend(&bytes);
+        assert_eq!(
+            upstream_response(&target, &response, false)
+                .unwrap()
+                .unwrap(),
+            bytes
+        );
+    }
+}

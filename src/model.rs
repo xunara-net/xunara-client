@@ -10,6 +10,9 @@ use serde_json::Value;
 pub struct Node {
     #[serde(rename = "ID")]
     pub id: u64,
+    #[serde(rename = "StableID")]
+    pub stable_id: String,
+    pub user: u64,
     pub name: String,
     pub key: String,
     pub disco_key: String,
@@ -34,9 +37,27 @@ pub struct Node {
 pub struct Hostinfo {
     #[serde(rename = "OS")]
     pub os: String,
+    pub services: Vec<Service>,
+}
+
+#[derive(Clone, Default, Deserialize)]
+#[serde(default, rename_all = "PascalCase")]
+pub struct Service {
+    pub proto: String,
+    pub port: u16,
 }
 
 impl Node {
+    pub fn exit_node(&self) -> bool {
+        self.valid()
+            && !self.stable_id.is_empty()
+            && self
+                .allowed_ips
+                .contains(&"0.0.0.0/0".parse().expect("constant prefix"))
+            && self
+                .allowed_ips
+                .contains(&"::/0".parse().expect("constant prefix"))
+    }
     pub fn relay_region(&self) -> u16 {
         if self.home_derp > 0 {
             self.home_derp
@@ -98,6 +119,37 @@ pub struct DerpMap {
 pub struct DnsConfig {
     pub proxied: bool,
     pub domains: Vec<String>,
+    pub resolvers: Vec<DnsResolver>,
+    pub fallback_resolvers: Vec<DnsResolver>,
+    #[serde(deserialize_with = "dns_routes")]
+    pub routes: BTreeMap<String, Vec<DnsResolver>>,
+    pub extra_records: Vec<DnsRecord>,
+}
+
+fn dns_routes<'de, Deserializer: serde::Deserializer<'de>>(
+    deserializer: Deserializer,
+) -> std::result::Result<BTreeMap<String, Vec<DnsResolver>>, Deserializer::Error> {
+    let routes = Option::<BTreeMap<String, Option<Vec<DnsResolver>>>>::deserialize(deserializer)?
+        .unwrap_or_default();
+    Ok(routes
+        .into_iter()
+        .map(|(suffix, resolvers)| (suffix, resolvers.unwrap_or_default()))
+        .collect())
+}
+
+#[derive(Clone, Default, Deserialize)]
+#[serde(default, rename_all = "PascalCase")]
+pub struct DnsResolver {
+    pub addr: String,
+}
+
+#[derive(Clone, Default, Deserialize)]
+#[serde(default, rename_all = "PascalCase")]
+pub struct DnsRecord {
+    pub name: String,
+    #[serde(rename = "Type")]
+    pub record_type: String,
+    pub value: String,
 }
 
 #[derive(Clone, Default)]
@@ -107,12 +159,30 @@ pub struct NetworkMap {
     pub derp: DerpMap,
     pub dns: DnsConfig,
     pub filter: Vec<Value>,
+    pub user_profiles: BTreeMap<u64, UserProfile>,
     filter_groups: BTreeMap<String, Vec<Value>>,
+}
+
+#[derive(Clone, Default, Deserialize)]
+#[serde(default, rename_all = "PascalCase")]
+pub struct UserProfile {
+    #[serde(rename = "ID")]
+    pub id: u64,
+    pub login_name: String,
 }
 
 impl NetworkMap {
     pub fn apply(&mut self, update: Value) -> Result<()> {
         ensure!(update.is_object(), "网络映射必须为 JSON 对象");
+        if let Some(profiles) = update.get("UserProfiles").and_then(Value::as_array) {
+            ensure!(profiles.len() <= 512, "用户展示资料超过上限");
+            for profile in profiles {
+                let profile: UserProfile = serde_json::from_value(profile.clone())?;
+                ensure!(profile.login_name.len() <= 320, "用户展示名称超过上限");
+                self.user_profiles.insert(profile.id, profile);
+            }
+            ensure!(self.user_profiles.len() <= 512, "用户展示资料超过上限");
+        }
         if let Some(node) = update.get("Node").filter(|node| !node.is_null()) {
             self.node = Some(serde_json::from_value(node.clone())?);
         }
@@ -123,7 +193,16 @@ impl NetworkMap {
         if let Some(dns) = update.get("DNSConfig").filter(|dns| !dns.is_null()) {
             let dns: DnsConfig = serde_json::from_value(dns.clone())?;
             ensure!(
-                dns.domains.len() <= 256 && dns.domains.iter().all(|domain| domain.len() <= 253),
+                dns.domains.len() <= 256
+                    && dns.domains.iter().all(|domain| domain.len() <= 253)
+                    && dns.resolvers.len() <= 16
+                    && dns.fallback_resolvers.len() <= 16
+                    && dns.routes.len() <= 256
+                    && dns
+                        .routes
+                        .iter()
+                        .all(|(suffix, resolvers)| suffix.len() <= 253 && resolvers.len() <= 16)
+                    && dns.extra_records.len() <= 4096,
                 "DNS 搜索域超过上限"
             );
             self.dns = dns;
@@ -151,7 +230,26 @@ impl NetworkMap {
                     && let (Some(peer), Some(patch)) = (peer.as_object_mut(), patch.as_object())
                 {
                     for (key, value) in patch {
-                        if key != "NodeID" && !value.is_null() {
+                        // PeerChange.DERPRegion 不是 Node 字段名，不能直接复制后让 serde 忽略。
+                        if key == "DERPRegion"
+                            && value
+                                .as_u64()
+                                .is_some_and(|region| region > 0 && region <= 65535)
+                        {
+                            peer.insert("HomeDERP".into(), value.clone());
+                        } else if !value.is_null()
+                            && (matches!(
+                                key.as_str(),
+                                "Endpoints"
+                                    | "Key"
+                                    | "DiscoKey"
+                                    | "KeyExpiry"
+                                    | "Online"
+                                    | "LastSeen"
+                                    | "CapMap"
+                                    | "KeySignature"
+                            ) || key == "Cap" && value.as_u64().is_some_and(|cap| cap > 0))
+                        {
                             peer.insert(key.clone(), value.clone());
                         }
                     }
@@ -211,6 +309,22 @@ impl NetworkMap {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn derp_patch_updates_node_field_and_zero_does_not_clear_home() {
+        let mut map = NetworkMap::default();
+        map.apply(json!({"Peers":[{"ID":1,"Key":"key","HomeDERP":0,"MachineAuthorized":false}]}))
+            .unwrap();
+        map.apply(
+            json!({"PeersChangedPatch":[{"NodeID":1,"DERPRegion":900,"MachineAuthorized":true}]}),
+        )
+        .unwrap();
+        assert_eq!(map.nodes().unwrap()[0].relay_region(), 900);
+        assert!(!map.nodes().unwrap()[0].machine_authorized);
+        map.apply(json!({"PeersChangedPatch":[{"NodeID":1,"DERPRegion":0}]}))
+            .unwrap();
+        assert_eq!(map.nodes().unwrap()[0].relay_region(), 900);
+    }
 
     #[test]
     fn merge_deltas_without_resurrecting_removed_peers_or_filters() {
