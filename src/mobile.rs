@@ -17,7 +17,7 @@ pub trait Host: Send + Sync {
     fn configure(&self, configuration: &VpnConfiguration) -> Result<OwnedFd>;
     fn local_networks(&self) -> Result<Vec<IpNet>>;
     fn local_endpoints(&self, port: u16) -> Vec<String>;
-    fn dns_servers(&self) -> Result<Vec<std::net::IpAddr>> {
+    fn dns_servers(&self) -> Result<Vec<std::net::SocketAddr>> {
         Ok(Vec::new())
     }
     fn event(&self, value: &Value);

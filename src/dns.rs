@@ -51,7 +51,7 @@ impl DnsPlan {
         config: &Config,
         map: &NetworkMap,
         local: &[IpNet],
-        fallback: &[IpAddr],
+        fallback: &[SocketAddr],
     ) -> Result<Option<Self>> {
         // 出口模式必须同时接管解析，防止把查询发给原 Wi-Fi 的 DNS。
         if !config.accept_dns && config.exit_node_id.is_empty() {
@@ -59,12 +59,44 @@ impl DnsPlan {
         }
         let node = map.node.as_ref().context("DNS 缺少本机映射")?;
         let peers = map.nodes()?;
-        let occupied = node
+        let mut occupied = node
             .addresses
             .iter()
             .chain(peers.iter().flat_map(|peer| peer.addresses.iter()))
             .copied()
             .collect::<Vec<_>>();
+        // 不仅避让设备地址，也避让远程已批准网段与解析器，防止 DNS 转发重新进入自己。
+        occupied.extend(
+            peers
+                .iter()
+                .flat_map(|peer| peer.allowed_ips.iter())
+                .filter(|prefix| prefix.prefix_len() > 0),
+        );
+        occupied.extend(
+            map.dns
+                .resolvers
+                .iter()
+                .chain(&map.dns.fallback_resolvers)
+                .chain(map.dns.routes.values().flatten())
+                .filter_map(|resolver| {
+                    resolver.addr.parse::<IpAddr>().ok().or_else(|| {
+                        resolver
+                            .addr
+                            .parse::<SocketAddr>()
+                            .ok()
+                            .map(|address| address.ip())
+                    })
+                })
+                .map(IpNet::from),
+        );
+        occupied.extend(fallback.iter().map(|address| IpNet::from(address.ip())));
+        occupied.extend(
+            map.dns
+                .extra_records
+                .iter()
+                .filter_map(|record| record.value.parse::<IpAddr>().ok())
+                .map(IpNet::from),
+        );
         let address = (100..=254)
             .map(|last| IpAddr::from([100, 100, 100, last]))
             .chain((1..=254).map(|last| IpAddr::from([198, 18, 0, last])))
@@ -173,10 +205,7 @@ impl DnsPlan {
                 plan.defaults = targets(&map.dns.fallback_resolvers)?;
             }
             if plan.defaults.is_empty() {
-                plan.defaults = fallback
-                    .iter()
-                    .map(|address| Target::Dns(SocketAddr::new(*address, 53)))
-                    .collect();
+                plan.defaults = fallback.iter().copied().map(Target::Dns).collect();
             }
         }
         Ok(Some(plan))
@@ -386,7 +415,7 @@ mod tests {
             &config,
             &map(),
             &["100.100.100.0/24".parse().unwrap()],
-            &["8.8.8.8".parse().unwrap()],
+            &["8.8.8.8:53".parse().unwrap()],
         )
         .unwrap()
         .unwrap();
@@ -409,5 +438,45 @@ mod tests {
         bytes[5] = 1;
         bytes.extend([0xc0, 12, 0, 1, 0, 1]);
         assert!(query(&bytes).is_err());
+    }
+
+    #[test]
+    fn system_dns_retains_ipv6_scope_without_changing_local_network_prefixes() {
+        let mut map = map();
+        map.dns.resolvers.clear();
+        let address = "[fe80::1%7]:53".parse::<SocketAddr>().unwrap();
+        let plan = DnsPlan::new(
+            &Config {
+                accept_dns: true,
+                ..Config::default()
+            },
+            &map,
+            &[],
+            &[address],
+        )
+        .unwrap()
+        .unwrap();
+        let Answer::Forward(targets) = plan.answer(&ask("example.com", RecordType::A)) else {
+            panic!("fallback")
+        };
+        assert_eq!(targets[0].address(), address);
+    }
+
+    #[test]
+    fn dns_address_avoids_remote_subnets_and_its_own_upstream() {
+        let mut map = map();
+        map.apply(json!({"PeersChanged":[{"ID":2,"Key":"peer","MachineAuthorized":true,"Addresses":["100.80.0.2/32"],"AllowedIPs":["100.100.100.0/24"]}]})).unwrap();
+        let config = Config {
+            accept_dns: true,
+            ..Config::default()
+        };
+        let plan = DnsPlan::new(&config, &map, &[], &[]).unwrap().unwrap();
+        assert_eq!(plan.address, "198.18.0.1".parse::<IpAddr>().unwrap());
+        map.peers.clear();
+        map.dns.resolvers = vec![DnsResolver {
+            addr: "100.100.100.100".into(),
+        }];
+        let plan = DnsPlan::new(&config, &map, &[], &[]).unwrap().unwrap();
+        assert_eq!(plan.address, "100.100.100.101".parse::<IpAddr>().unwrap());
     }
 }

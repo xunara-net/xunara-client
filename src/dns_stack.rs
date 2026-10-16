@@ -608,7 +608,17 @@ async fn direct(target: &Target, query: &Message) -> Result<Message> {
     let Target::Dns(address) = target else {
         bail!("出口 DNS 只能走加密隧道");
     };
-    tokio::time::timeout(Duration::from_secs(3), async {
+    tokio::time::timeout(Duration::from_secs(4), async {
+        let mut upstream = query.clone();
+        upstream.metadata.id = OsRng.next_u32() as u16;
+        // 普通网络 DNS 优先 UDP；连接到指定解析器并核对随机事务，截断或不可用再回退 TCP。
+        if let Ok(Ok(mut response)) =
+            tokio::time::timeout(Duration::from_secs(1), direct_udp(*address, &upstream)).await
+            && !response.metadata.truncation
+        {
+            response.metadata.id = query.metadata.id;
+            return Ok(response);
+        }
         let socket = if address.is_ipv4() {
             tokio::net::TcpSocket::new_v4()?
         } else {
@@ -620,15 +630,38 @@ async fn direct(target: &Target, query: &Message) -> Result<Message> {
             crate::mobile::host()?.protect(socket.as_raw_fd())?;
         }
         let mut stream = socket.connect(*address).await?;
-        stream.write_all(&upstream_request(target, query)?).await?;
+        stream
+            .write_all(&upstream_request(target, &upstream)?)
+            .await?;
         let length = stream.read_u16().await? as usize;
         ensure!(length >= 12, "DNS 回包过短");
         let mut bytes = vec![0; length];
         stream.read_exact(&mut bytes).await?;
-        dns::verified(query, &bytes)
+        let mut response = dns::verified(&upstream, &bytes)?;
+        response.metadata.id = query.metadata.id;
+        Ok(response)
     })
     .await
     .context("DNS 上游查询超时")?
+}
+
+async fn direct_udp(address: std::net::SocketAddr, query: &Message) -> Result<Message> {
+    let socket = tokio::net::UdpSocket::bind(if address.is_ipv4() {
+        "0.0.0.0:0"
+    } else {
+        "[::]:0"
+    })
+    .await?;
+    #[cfg(target_os = "android")]
+    {
+        use std::os::fd::AsRawFd;
+        crate::mobile::host()?.protect(socket.as_raw_fd())?;
+    }
+    socket.connect(address).await?;
+    socket.send(&query.to_vec()?).await?;
+    let mut bytes = vec![0; 65535];
+    let length = socket.recv(&mut bytes).await?;
+    dns::verified(query, &bytes[..length])
 }
 
 #[cfg(test)]
@@ -640,6 +673,53 @@ mod tests {
         rr::{Name, RecordType},
     };
     use serde_json::json;
+
+    #[tokio::test]
+    async fn direct_dns_uses_udp_and_falls_back_to_tcp_for_truncated_answers() {
+        for truncated in [false, true] {
+            let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let address = socket.local_addr().unwrap();
+            let listener = tokio::net::TcpListener::bind(address).await.unwrap();
+            let task = tokio::spawn(async move {
+                let mut bytes = [0; 4096];
+                let (length, source) = socket.recv_from(&mut bytes).await.unwrap();
+                let query = dns::query(&bytes[..length]).unwrap();
+                let mut response = dns::reply(&query, ResponseCode::NoError);
+                response.answers.push(hickory_proto::rr::Record::from_rdata(
+                    query.queries[0].name().clone(),
+                    60,
+                    hickory_proto::rr::RData::from("203.0.113.77".parse::<IpAddr>().unwrap()),
+                ));
+                let mut datagram = response.clone();
+                datagram.metadata.truncation = truncated;
+                socket
+                    .send_to(&datagram.to_vec().unwrap(), source)
+                    .await
+                    .unwrap();
+                if truncated {
+                    let (mut stream, _) = listener.accept().await.unwrap();
+                    let length = stream.read_u16().await.unwrap() as usize;
+                    let mut request = vec![0; length];
+                    stream.read_exact(&mut request).await.unwrap();
+                    assert_eq!(dns::query(&request).unwrap().metadata.id, query.metadata.id);
+                    stream
+                        .write_all(&frame(&response.to_vec().unwrap()))
+                        .await
+                        .unwrap();
+                }
+            });
+            let mut query = Message::query();
+            query.queries.push(Query::query(
+                Name::from_ascii("external.public.test.").unwrap(),
+                RecordType::A,
+            ));
+            let response = direct(&Target::Dns(address), &query).await.unwrap();
+            assert_eq!(response.metadata.id, query.metadata.id);
+            assert!(!response.metadata.truncation);
+            assert_eq!(response.answers.len(), 1);
+            task.await.unwrap();
+        }
+    }
 
     fn proxy() -> DnsProxy {
         let mut map = NetworkMap::default();
