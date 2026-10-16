@@ -136,6 +136,16 @@ impl Routes {
         self.local_destination(address)
     }
 
+    pub fn remote_destination(&self, address: IpAddr) -> bool {
+        !self.local_destination(address)
+            && self.configuration.as_ref().is_some_and(|configuration| {
+                configuration
+                    .routes
+                    .iter()
+                    .any(|route| route.contains(&address))
+            })
+    }
+
     pub async fn clear_nat(&mut self) -> Result<()> {
         Ok(())
     }

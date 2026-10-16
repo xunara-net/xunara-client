@@ -26,6 +26,14 @@ pub struct Node {
     pub expired: bool,
     pub is_jailed: bool,
     pub machine_authorized: bool,
+    pub hostinfo: Option<Hostinfo>,
+}
+
+#[derive(Clone, Default, Deserialize)]
+#[serde(default, rename_all = "PascalCase")]
+pub struct Hostinfo {
+    #[serde(rename = "OS")]
+    pub os: String,
 }
 
 impl Node {
@@ -74,6 +82,8 @@ pub struct DerpNode {
 #[derive(Clone, Default, Deserialize)]
 #[serde(default, rename_all = "PascalCase")]
 pub struct DerpRegion {
+    pub region_code: String,
+    pub region_name: String,
     pub nodes: Vec<DerpNode>,
 }
 
@@ -83,11 +93,19 @@ pub struct DerpMap {
     pub regions: BTreeMap<u16, DerpRegion>,
 }
 
+#[derive(Clone, Default, Deserialize)]
+#[serde(default, rename_all = "PascalCase")]
+pub struct DnsConfig {
+    pub proxied: bool,
+    pub domains: Vec<String>,
+}
+
 #[derive(Clone, Default)]
 pub struct NetworkMap {
     pub node: Option<Node>,
     pub peers: BTreeMap<u64, Value>,
     pub derp: DerpMap,
+    pub dns: DnsConfig,
     pub filter: Vec<Value>,
     filter_groups: BTreeMap<String, Vec<Value>>,
 }
@@ -100,6 +118,15 @@ impl NetworkMap {
         }
         if let Some(derp) = update.get("DERPMap").filter(|derp| !derp.is_null()) {
             self.derp = serde_json::from_value(derp.clone())?;
+        }
+        // 与官方 MapResponse 一致：缺失 / null 表示沿用，空对象表示显式清空。
+        if let Some(dns) = update.get("DNSConfig").filter(|dns| !dns.is_null()) {
+            let dns: DnsConfig = serde_json::from_value(dns.clone())?;
+            ensure!(
+                dns.domains.len() <= 256 && dns.domains.iter().all(|domain| domain.len() <= 253),
+                "DNS 搜索域超过上限"
+            );
+            self.dns = dns;
         }
         if let Some(peers) = update.get("Peers").and_then(Value::as_array) {
             self.peers.clear();
@@ -216,5 +243,23 @@ mod tests {
         assert_eq!(map.filter.len(), 1);
         map.apply(json!({"PacketFilters":{"*":null}})).unwrap();
         assert!(map.filter.is_empty());
+    }
+
+    #[test]
+    fn dns_deltas_preserve_and_clear_metadata_without_changing_system_dns() {
+        let mut map = NetworkMap::default();
+        map.apply(json!({"DNSConfig":{"Proxied":true,"Domains":["example.test"]}}))
+            .unwrap();
+        map.apply(json!({"DNSConfig":null})).unwrap();
+        assert!(map.dns.proxied);
+        assert_eq!(map.dns.domains, vec!["example.test"]);
+        map.apply(json!({})).unwrap();
+        assert!(map.dns.proxied);
+        map.apply(json!({"DNSConfig":{}})).unwrap();
+        assert!(!map.dns.proxied && map.dns.domains.is_empty());
+        assert!(
+            map.apply(json!({"DNSConfig":{"Domains":["x".repeat(254)]}}))
+                .is_err()
+        );
     }
 }

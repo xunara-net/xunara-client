@@ -3,6 +3,7 @@
 pub mod config;
 pub mod control;
 pub mod derp;
+pub mod diagnostic;
 pub mod discovery;
 pub mod engine;
 pub mod filter;

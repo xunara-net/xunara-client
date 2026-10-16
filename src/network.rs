@@ -295,6 +295,11 @@ impl Routes {
         self.local_destination(address)
     }
 
+    pub fn remote_destination(&self, address: IpAddr) -> bool {
+        !self.local_destination(address)
+            && self.installed.iter().any(|route| route.contains(&address))
+    }
+
     pub async fn clear_nat(&mut self) -> Result<()> {
         if let Some(table) = &self.nat {
             command("nft", &["delete", "table", "inet", table], None).await?;

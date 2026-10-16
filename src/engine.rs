@@ -20,6 +20,7 @@ use tokio::{
 use crate::{
     config::Config,
     derp::{Hub, Received},
+    diagnostic::{PingRequest, Pings},
     discovery,
     filter::{Filter, Packet},
     model::{NetworkMap, Node},
@@ -129,6 +130,8 @@ pub struct Engine {
     sent_bytes: u64,
     ticks: u64,
     budget: u32,
+    diagnostic_input: Option<mpsc::Receiver<PingRequest>>,
+    pings: Pings,
 }
 
 impl Engine {
@@ -175,7 +178,13 @@ impl Engine {
             sent_bytes: 0,
             ticks: 0,
             budget: 100,
+            diagnostic_input: None,
+            pings: Pings::default(),
         })
+    }
+
+    pub fn enable_diagnostics(&mut self, requests: mpsc::Receiver<PingRequest>) {
+        self.diagnostic_input = Some(requests);
     }
 
     pub async fn run(&mut self, mut maps: mpsc::Receiver<NetworkMap>, store: &Store) -> Result<()> {
@@ -188,6 +197,7 @@ impl Engine {
                 Udp(std::io::Result<(usize, SocketAddr)>),
                 Packet(std::io::Result<usize>),
                 Derp(Option<Received>),
+                Ping(Option<PingRequest>),
                 Tick,
             }
             let event = tokio::select! {
@@ -195,6 +205,12 @@ impl Engine {
                 received = self.socket.recv_from(&mut udp) => Event::Udp(received),
                 length = self.tun.read(&mut packet) => Event::Packet(length),
                 received = self.derp_input.recv() => Event::Derp(received),
+                request = async {
+                    match self.diagnostic_input.as_mut() {
+                        Some(requests) => requests.recv().await,
+                        None => std::future::pending().await,
+                    }
+                } => Event::Ping(request),
                 _ = ticker.tick() => Event::Tick,
             };
             match event {
@@ -221,7 +237,10 @@ impl Engine {
                     .await?
                 }
                 Event::Derp(None) => anyhow::bail!("中继输入已停止"),
+                Event::Ping(Some(request)) => self.ping(request).await?,
+                Event::Ping(None) => self.diagnostic_input = None,
                 Event::Tick => {
+                    self.pings.expire();
                     self.tick().await?;
                     #[cfg(target_os = "android")]
                     crate::mobile::publish(&self.snapshot());
@@ -364,6 +383,43 @@ impl Engine {
         );
         if let Output::Wire(bytes) = action {
             self.transmit(selected, None, &bytes).await;
+        }
+        Ok(())
+    }
+
+    async fn ping(&mut self, request: PingRequest) -> Result<()> {
+        let addresses = (|| -> Result<_> {
+            ensure!(self.fresh(), "网络映射已失效，请连接后重试");
+            let peer = self
+                .peers
+                .get(&request.peer)
+                .filter(|peer| peer.node.valid())
+                .context("设备不在当前授权网络内")?;
+            let node = self.map.node.as_ref().context("本机尚未授权")?;
+            let (source, target) = peer
+                .node
+                .addresses
+                .iter()
+                .filter(|address| self.routes.remote_destination(address.addr()))
+                .find_map(|target| {
+                    node.addresses
+                        .iter()
+                        .find(|source| source.addr().is_ipv4() == target.addr().is_ipv4())
+                        .map(|source| (source.addr(), target.addr()))
+                })
+                .context("没有可用的设备路由，可能与手机局域网冲突")?;
+            Ok((source, target))
+        })();
+        match addresses {
+            Ok((source, target)) => {
+                if let Some(bytes) = self.pings.start(request, source, target) {
+                    // 诊断走同一 WireGuard / 路由 / 回包 ACL，不使用 App 自身被豁免的 socket。
+                    self.outgoing(&bytes).await?;
+                }
+            }
+            Err(error) => {
+                let _ = request.reply.try_send(Err(error));
+            }
         }
         Ok(())
     }
@@ -515,7 +571,13 @@ impl Engine {
                     && self.routes.local_destination(packet.destination)
                     && self.filter.incoming(packet)
                 {
-                    self.tun.write(&bytes).await?;
+                    let (path, region) = match path {
+                        Path::Udp(_) => ("direct", 0),
+                        Path::Derp(region) => ("relay", region),
+                    };
+                    if !self.pings.receive(identity, &bytes, path, region) {
+                        self.tun.write(&bytes).await?;
+                    }
                     self.received_bytes += bytes.len() as u64;
                 }
             }
@@ -722,6 +784,10 @@ impl Engine {
             .as_object_mut()
             .expect("snapshot object")
             .remove("devices");
+        snapshot
+            .as_object_mut()
+            .expect("snapshot object")
+            .remove("dns");
         store.write("status.json", &snapshot)
     }
 
@@ -730,13 +796,19 @@ impl Engine {
             "online":self.fresh(),"interface":self.config.interface,"addresses":self.map.node.as_ref().map(|node| &node.addresses),
             "peers":self.peers.len(),"direct_peers":self.peers.values().filter(|peer| peer.direct.is_some_and(|(_,seen)| seen.elapsed() < Duration::from_secs(25))).count(),
             "bytes_received":self.received_bytes,"bytes_sent":self.sent_bytes,"advertised_routes":self.config.advertise_routes,
+            "self_name":self.map.node.as_ref().map(|node| &node.name),"key_expiry":self.map.node.as_ref().and_then(|node| node.key_expiry.as_ref()),
+            "dns":{"enabled":self.map.dns.proxied,"domains":self.map.dns.domains},
             "devices":self.peers.values().map(|peer| json!({"id":peer.node.id.to_string(),"name":peer.node.name,"addresses":peer.node.addresses,
+                "os":peer.node.hostinfo.as_ref().map(|hostinfo| &hostinfo.os),"key_expiry":peer.node.key_expiry,
+                "routes":peer.node.allowed_ips.iter().filter(|prefix| prefix.prefix_len()>0 && prefix.prefix_len() < if prefix.addr().is_ipv4(){32}else{128}).collect::<Vec<_>>(),
                 "authorized":peer.node.valid(),"path":if peer.direct.is_some_and(|(_,seen)| seen.elapsed()<Duration::from_secs(25)){"direct"}else{"relay"},
+                "relay_name":self.map.derp.regions.get(&peer.node.relay_region()).map(|region| if region.region_name.is_empty(){&region.region_code}else{&region.region_name}),
                 "relay_region":peer.node.relay_region()})).collect::<Vec<_>>()})
     }
 
     pub async fn stop(&mut self) -> Result<()> {
         self.last_map = None;
+        self.pings = Pings::default();
         self.peers.clear();
         self.hub = Hub::default();
         #[cfg(target_os = "android")]

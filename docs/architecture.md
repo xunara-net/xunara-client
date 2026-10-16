@@ -20,6 +20,10 @@ Android 使用同一 `engine` / `control` / ACL / WireGuard / DERP，只有 `net
 
 参考 [Android VPN 官方文档](https://developer.android.com/develop/connectivity/vpn) 和 [Tailscale Android 套接字保护实现](https://github.com/tailscale/tailscale/blob/v1.104.1/net/netns/netns_android.go)。协议 wire 没有 Android 专有分支；只按运行平台报告既有 Hostinfo.OS。
 
+`diagnostic` 的 ICMPv4 / ICMPv6 Echo 遵循 [RFC 792](https://www.rfc-editor.org/rfc/rfc792) / [RFC 4443](https://www.rfc-editor.org/rfc/rfc4443)。最多四条未完成请求、500ms 发起间隔、8 秒超时。应用只能传可见 peer ID，不能任意构造报文或指定外部目的地址。回包必须先经过通常的 WireGuard / peer 来源 / ACL 检查，再匹配 peer、两端地址、随机 identifier / sequence / payload、校验和；使用完成后即删除，防止重放。路径取实际收到回包的 UDP / DERP，不根据配置猜测。
+
+DNS 元信息按官方 [tailcfg.DNSConfig](https://github.com/tailscale/tailscale/blob/v1.104.1/tailcfg/tailcfg.go) 增量语义读取，不安装解析器、不添加 DNS 路由；详细设备与 DNS 列表仅留在移动回调内存中，CLI 磁盘状态不随之膨胀。
+
 ## Why
 
 最小体积目标优先 Linux CLI 和内核 IP 转发，而非复制完整客户端产品。只复用官方 Rust 上游的底层 Noise / key 组件；官方高层库仍未提供当前所需的完整子网路由与私有 DERP 产品能力，因此不直接把该库包装成“已经完成”的客户端。
