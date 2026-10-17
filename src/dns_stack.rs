@@ -789,6 +789,7 @@ mod tests {
         });
         let mut query = Message::query();
         query.metadata.recursion_desired = true;
+        query.metadata.authentic_data = true;
         query.queries.push(Query::query(
             Name::from_ascii("cloudflare.com.").unwrap(),
             RecordType::A,
@@ -799,6 +800,25 @@ mod tests {
             .expect("real DNSSEC chain must validate");
         assert!(response.metadata.authentic_data);
         assert!(!response.answers.is_empty());
+        assert!(response.edns.is_none());
+        assert!(
+            response
+                .answers
+                .iter()
+                .all(|record| !record.record_type().is_dnssec())
+        );
+        let mut legacy_query = query.clone();
+        legacy_query.metadata.authentic_data = false;
+        let legacy = validator.query(legacy_query).await.unwrap();
+        assert!(!legacy.metadata.authentic_data);
+        assert!(legacy.edns.is_none());
+        assert!(!legacy.answers.is_empty());
+        assert!(
+            legacy
+                .answers
+                .iter()
+                .all(|record| !record.record_type().is_dnssec())
+        );
         query.queries[0] = Query::query(
             Name::from_ascii("xunara-dnssec-proof.invalid.").unwrap(),
             RecordType::A,

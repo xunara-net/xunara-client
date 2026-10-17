@@ -69,6 +69,8 @@ WireGuard 使用 Cloudflare BoringTun 的固定发布版本。路由、ACL、DER
 
 DNSSEC 由 Hickory 0.26.3 的 DnssecDnsHandle 验证根信任锚、DNSKEY / DS / RRSIG 和否定证明。验证子查询通过有界通道回到原 DNS 路由，不能偷开一个绕过出口的验证解析器。向上游索取 CD 原始材料，清除原始 AD；只有本地验证后才设置 AD。资源上限包含 64 个 DNS 请求、外部请求保留内部递归额度、512 项验证缓存、NSEC3 迭代限制和 12 秒整体验证期限。
 
+响应在完成本机验证后按原始查询投影：未设置 DO 时移除未显式请求的 DNSSEC 记录，AD 仅在已验证且客户端设置 DO / AD 时置位；EDNS 不继承验证器追加的算法选项。遵循 [RFC 4035 §3.2.1](https://www.rfc-editor.org/rfc/rfc4035.html#section-3.2.1) 与 [RFC 6840 §5.6–5.8](https://www.rfc-editor.org/rfc/rfc6840.html#section-5.6)，避免普通手机解析器收到不兼容响应。
+
 共享 masquerade 的源转换位于原出站状态跟踪之后；目的还原位于认证 peer 解密之后、原来源和 ACL 验证之前。别名只属于对应 WireGuard peer，不用 IP 查到另一个租户的映射；本机后方的子网地址不套用本机别名。IPv4 UDP 未启用校验时保留零，IPv6 零 UDP 校验拒绝。
 
 ### Why
