@@ -1,4 +1,7 @@
-use std::{collections::BTreeMap, net::SocketAddr};
+use std::{
+    collections::BTreeMap,
+    net::{Ipv4Addr, Ipv6Addr, SocketAddr},
+};
 
 use anyhow::{Result, ensure};
 use ipnet::IpNet;
@@ -30,6 +33,10 @@ pub struct Node {
     pub is_jailed: bool,
     pub machine_authorized: bool,
     pub hostinfo: Option<Hostinfo>,
+    #[serde(rename = "SelfNodeV4MasqAddrForThisPeer")]
+    pub self_v4_masq: Option<Ipv4Addr>,
+    #[serde(rename = "SelfNodeV6MasqAddrForThisPeer")]
+    pub self_v6_masq: Option<Ipv6Addr>,
 }
 
 #[derive(Clone, Default, Deserialize)]
@@ -71,6 +78,15 @@ impl Node {
 
     pub fn valid(&self) -> bool {
         !self.expired
+            && self.self_v4_masq.is_none_or(|address| {
+                !address.is_unspecified()
+                    && !address.is_loopback()
+                    && !address.is_multicast()
+                    && !address.is_broadcast()
+            })
+            && self.self_v6_masq.is_none_or(|address| {
+                !address.is_unspecified() && !address.is_loopback() && !address.is_multicast()
+            })
             && !self.is_jailed
             && self.machine_authorized
             && self.key_expiry.as_ref().is_none_or(|expiry| {
@@ -141,6 +157,7 @@ fn dns_routes<'de, Deserializer: serde::Deserializer<'de>>(
 #[serde(default, rename_all = "PascalCase")]
 pub struct DnsResolver {
     pub addr: String,
+    pub bootstrap_resolution: Vec<std::net::IpAddr>,
 }
 
 #[derive(Clone, Default, Deserialize)]
@@ -174,6 +191,14 @@ pub struct UserProfile {
 impl NetworkMap {
     pub fn apply(&mut self, update: Value) -> Result<()> {
         ensure!(update.is_object(), "网络映射必须为 JSON 对象");
+        if let Some(authority) = update.get("TKAInfo").filter(|value| !value.is_null()) {
+            ensure!(authority.is_object(), "Tailnet Lock 状态格式无效");
+            // 尚未实现本机信任根与 AUM 同步时，不能靠控制面声称“已签名”继续传输。
+            ensure!(
+                authority.get("Disabled").and_then(Value::as_bool) == Some(true),
+                "此网络启用了 Tailnet Lock；本版本尚未完成本机签名链验证，已拒绝建立不受保护的连接"
+            );
+        }
         if let Some(profiles) = update.get("UserProfiles").and_then(Value::as_array) {
             ensure!(profiles.len() <= 512, "用户展示资料超过上限");
             for profile in profiles {
@@ -202,7 +227,14 @@ impl NetworkMap {
                         .routes
                         .iter()
                         .all(|(suffix, resolvers)| suffix.len() <= 253 && resolvers.len() <= 16)
-                    && dns.extra_records.len() <= 4096,
+                    && dns.extra_records.len() <= 4096
+                    && dns
+                        .resolvers
+                        .iter()
+                        .chain(&dns.fallback_resolvers)
+                        .chain(dns.routes.values().flatten())
+                        .all(|resolver| resolver.addr.len() <= 2048
+                            && resolver.bootstrap_resolution.len() <= 4),
                 "DNS 搜索域超过上限"
             );
             self.dns = dns;
@@ -308,6 +340,20 @@ impl NetworkMap {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn unimplemented_tailnet_lock_cannot_silently_accept_an_authority() {
+        let mut map = NetworkMap::default();
+        assert!(
+            map.apply(serde_json::json!({"TKAInfo":{"Head":"unverified-head"}}))
+                .is_err()
+        );
+        assert!(map.apply(serde_json::json!({"TKAInfo":{}})).is_err());
+        assert!(
+            map.apply(serde_json::json!({"TKAInfo":{"Disabled":true}}))
+                .is_ok()
+        );
+        assert!(map.apply(serde_json::json!({"TKAInfo":null})).is_ok());
+    }
     use serde_json::json;
 
     #[test]

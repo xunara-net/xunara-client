@@ -64,6 +64,8 @@ func main() {
 			break
 		}
 		_, err = stun.ParseBindingRequest(packet)
+	case "masq-vector":
+		err = masqueradeVector(*target)
 	case "fixture":
 		err = fixture(ctx, *directory)
 	default:

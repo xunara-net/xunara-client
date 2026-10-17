@@ -19,12 +19,18 @@ use crate::{
 pub enum Target {
     Dns(SocketAddr),
     PeerHttp(SocketAddr),
+    Encrypted {
+        address: SocketAddr,
+        name: String,
+        path: Option<String>,
+    },
 }
 
 impl Target {
     pub fn address(&self) -> SocketAddr {
         match self {
             Self::Dns(address) | Self::PeerHttp(address) => *address,
+            Self::Encrypted { address, .. } => *address,
         }
     }
 }
@@ -39,6 +45,7 @@ pub struct DnsPlan {
     defaults: Vec<Target>,
     tunnel_routes: Vec<IpNet>,
     exit: bool,
+    pub dnssec_validate: bool,
 }
 
 pub enum Answer {
@@ -90,6 +97,36 @@ impl DnsPlan {
                 .map(IpNet::from),
         );
         occupied.extend(fallback.iter().map(|address| IpNet::from(address.ip())));
+        for peer in &peers {
+            occupied.extend(
+                peer.self_v4_masq
+                    .map(IpAddr::V4)
+                    .into_iter()
+                    .chain(peer.self_v6_masq.map(IpAddr::V6))
+                    .map(IpNet::from),
+            );
+        }
+        for resolver in map
+            .dns
+            .resolvers
+            .iter()
+            .chain(&map.dns.fallback_resolvers)
+            .chain(map.dns.routes.values().flatten())
+            .chain(&config.dns_resolvers)
+        {
+            occupied.extend(
+                resolver
+                    .bootstrap_resolution
+                    .iter()
+                    .copied()
+                    .map(IpNet::from),
+            );
+            occupied.extend(
+                targets(std::slice::from_ref(resolver))?
+                    .iter()
+                    .map(|target| IpNet::from(target.address().ip())),
+            );
+        }
         occupied.extend(
             map.dns
                 .extra_records
@@ -116,6 +153,7 @@ impl DnsPlan {
             defaults: Vec::new(),
             tunnel_routes: Vec::new(),
             exit: !config.exit_node_id.is_empty(),
+            dnssec_validate: config.dnssec_validate,
         };
         for domain in &map.dns.domains {
             plan.domains.push(
@@ -200,7 +238,11 @@ impl DnsPlan {
             }
             // 没有出口解析器就 SERVFAIL，绝不回退本地网络或其他出口。
         } else {
-            plan.defaults = targets(&map.dns.resolvers)?;
+            plan.defaults = targets(if config.dns_resolvers.is_empty() {
+                &map.dns.resolvers
+            } else {
+                &config.dns_resolvers
+            })?;
             if plan.defaults.is_empty() {
                 plan.defaults = targets(&map.dns.fallback_resolvers)?;
             }
@@ -274,25 +316,81 @@ fn valid_name(raw: &str) -> Result<Name> {
     Ok(name)
 }
 
-fn targets(resolvers: &[DnsResolver]) -> Result<Vec<Target>> {
+pub fn targets(resolvers: &[DnsResolver]) -> Result<Vec<Target>> {
     resolvers
         .iter()
-        .map(|resolver| {
+        .map(|resolver| -> Result<Vec<Target>> {
+            ensure!(
+                resolver.addr.len() <= 2048 && resolver.bootstrap_resolution.len() <= 4,
+                "DNS 解析器配置超过上限"
+            );
+            if resolver.addr.starts_with("https://") || resolver.addr.starts_with("tls://") {
+                let url = url::Url::parse(&resolver.addr)?;
+                ensure!(
+                    url.username().is_empty()
+                        && url.password().is_none()
+                        && url.query().is_none()
+                        && url.fragment().is_none(),
+                    "加密 DNS 地址不可包含凭据、查询参数或片段"
+                );
+                let name = url
+                    .host_str()
+                    .context("DNS 解析器缺少主机名")?
+                    .trim_matches(['[', ']'])
+                    .to_owned();
+                let https = url.scheme() == "https";
+                ensure!(
+                    https || url.path().is_empty() || url.path() == "/",
+                    "DoT 仅填写主机和端口"
+                );
+                let port = url.port().unwrap_or(if https { 443 } else { 853 });
+                ensure!(port > 0, "DNS 解析器端口无效");
+                let addresses = if let Ok(address) = name.parse::<IpAddr>() {
+                    vec![address]
+                } else {
+                    resolver.bootstrap_resolution.clone()
+                };
+                ensure!(
+                    !addresses.is_empty(),
+                    "域名形式的 DoH / DoT 解析器需要引导 IP，避免 VPN DNS 递归"
+                );
+                return addresses
+                    .into_iter()
+                    .map(|address| {
+                        ensure!(
+                            !address.is_unspecified() && !address.is_multicast(),
+                            "DNS 引导地址无效"
+                        );
+                        Ok(Target::Encrypted {
+                            address: SocketAddr::new(address, port),
+                            name: name.clone(),
+                            path: https.then(|| {
+                                if url.path().is_empty() {
+                                    "/dns-query".to_owned()
+                                } else {
+                                    url.path().to_owned()
+                                }
+                            }),
+                        })
+                    })
+                    .collect();
+            }
             let address = resolver
                 .addr
                 .parse::<IpAddr>()
                 .map(|address| SocketAddr::new(address, 53))
                 .or_else(|_| resolver.addr.parse::<SocketAddr>())
-                .context("本版 DNS 解析器须为 IP 或 IP:端口")?;
+                .context("DNS 解析器须为 IP、IP:端口、https:// 或 tls:// 地址")?;
             ensure!(
                 address.port() > 0
                     && !address.ip().is_unspecified()
                     && !address.ip().is_multicast(),
                 "DNS 解析器地址无效"
             );
-            Ok(Target::Dns(address))
+            Ok(vec![Target::Dns(address)])
         })
-        .collect()
+        .collect::<Result<Vec<_>>>()
+        .map(|groups| groups.into_iter().flatten().collect())
 }
 
 pub fn query(bytes: &[u8]) -> Result<Message> {
@@ -320,7 +418,7 @@ pub fn reply(query: &Message, code: ResponseCode) -> Message {
 }
 
 pub fn verified(query: &Message, bytes: &[u8]) -> Result<Message> {
-    let response = Message::from_vec(bytes)?;
+    let mut response = Message::from_vec(bytes)?;
     ensure!(
         response.metadata.message_type == MessageType::Response
             && response.metadata.id == query.metadata.id
@@ -328,6 +426,7 @@ pub fn verified(query: &Message, bytes: &[u8]) -> Result<Message> {
             && response.metadata.op_code == query.metadata.op_code,
         "DNS 回包不属于当前查询"
     );
+    response.metadata.authentic_data = false;
     Ok(response)
 }
 
@@ -342,6 +441,46 @@ pub fn encode(response: &Message, limit: usize) -> Result<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn encrypted_resolvers_require_safe_urls_and_explicit_bootstrap() {
+        for address in [
+            "http://resolver.test/dns-query",
+            "https://user:secret@resolver.test/dns-query",
+            "https://resolver.test/dns-query?token=secret",
+            "tls://resolver.test/path",
+            "https://resolver.test/dns-query",
+        ] {
+            assert!(
+                targets(&[DnsResolver {
+                    addr: address.into(),
+                    ..DnsResolver::default()
+                }])
+                .is_err()
+            );
+        }
+        for address in [
+            "https://resolver.test/dns-query",
+            "tls://resolver.test:8853",
+        ] {
+            let parsed = targets(&[DnsResolver {
+                addr: address.into(),
+                bootstrap_resolution: vec!["192.0.2.53".parse().unwrap()],
+            }])
+            .unwrap();
+            assert_eq!(parsed.len(), 1);
+            assert!(
+                matches!(&parsed[0], Target::Encrypted { name, .. } if name == "resolver.test")
+            );
+        }
+        assert!(matches!(
+            targets(&[DnsResolver {
+                addr: "https://[2001:db8::53]/dns-query".into(),
+                ..DnsResolver::default()
+            }])
+            .unwrap()[0],
+            Target::Encrypted { .. }
+        ));
+    }
     use hickory_proto::{op::Query, rr::RecordType};
     use serde_json::json;
 
@@ -475,6 +614,7 @@ mod tests {
         map.peers.clear();
         map.dns.resolvers = vec![DnsResolver {
             addr: "100.100.100.100".into(),
+            ..DnsResolver::default()
         }];
         let plan = DnsPlan::new(&config, &map, &[], &[]).unwrap().unwrap();
         assert_eq!(plan.address, "100.100.100.101".parse::<IpAddr>().unwrap());

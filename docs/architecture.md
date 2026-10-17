@@ -60,3 +60,29 @@ WireGuard 使用 Cloudflare BoringTun 的固定发布版本。路由、ACL、DER
 ## Tests
 
 `cargo` 单测覆盖配置、密钥文件、锁、状态损坏、映射/ACL增量、ACL默认拒绝与返回状态、分片拒绝、Disco 认证、STUN编码、LAN冲突。`scripts/test-netns.sh` 为真实 TUN / WireGuard / 官方客户端 / 子网 / DERP 的整体验证入口；不将只有模拟 HTTP 的测试当作数据面验收。
+
+## Android 加密 DNS 与共享地址（2026-10-18）
+
+### What changed
+
+`Target::Encrypted` 在既有 DNS 专用 TCP 栈上承载 DoT 或 HTTPS POST；物理网络用受保护 socket，网内解析器仍走 WireGuard / ACL。TLS 状态机由 rustls 校验 CA / 主机名。域名形式需 BootstrapResolution，避免改完 VPN DNS 后递归查询解析器自身。HTTPS 使用 HTTP/1.0 有界消息，不接受重定向或分块响应。
+
+DNSSEC 由 Hickory 0.26.3 的 DnssecDnsHandle 验证根信任锚、DNSKEY / DS / RRSIG 和否定证明。验证子查询通过有界通道回到原 DNS 路由，不能偷开一个绕过出口的验证解析器。向上游索取 CD 原始材料，清除原始 AD；只有本地验证后才设置 AD。资源上限包含 64 个 DNS 请求、外部请求保留内部递归额度、512 项验证缓存、NSEC3 迭代限制和 12 秒整体验证期限。
+
+共享 masquerade 的源转换位于原出站状态跟踪之后；目的还原位于认证 peer 解密之后、原来源和 ACL 验证之前。别名只属于对应 WireGuard peer，不用 IP 查到另一个租户的映射；本机后方的子网地址不套用本机别名。IPv4 UDP 未启用校验时保留零，IPv6 零 UDP 校验拒绝。
+
+### Why
+
+不能只把 HTTPS URL 保存到 UI，实际却继续用明文解析；DNSSEC 也不能靠上游 AD 位置假。跨租户共享不等于合并身份或跳过 ACL，必须按上游的 peer 专属地址转换实现。
+
+### Compatibility impact
+
+保持官方 DNSConfig / Resolver.BootstrapResolution 和 SelfNodeV4/V6MasqAddrForThisPeer wire 字段；无服务端新端点、迁移或客户端协议分叉。Linux 仍不接管系统 DNS / 默认路由。Tailnet Lock 完整参与仍未完成，启用状态明确拒绝，不能宣称已验证签名。
+
+### Security impact
+
+不允许 URL 凭据 / query / fragment，不跳过证书验证，不在加密 DNS 或签名失败时退回明文。原始上游 AD 不可信；MagicDNS 的控制面本地记录不冒充 DNSSEC 签名。第三方应用自带 HTTPS DNS 不能安全透明改写，手机界面只提供准确检测与用户设置入口。
+
+### Tests
+
+Rust 规范与协议测试、临时 CA 的 TLS 正向 / 错域名 / 非可信 CA 测试、伪 AD 拒绝；公共 HTTPS 实测签名链、签名 NXDOMAIN 与 dnssec-failed.org 拒绝。`tests/compat` 用官方 Go checksum 对照双栈 TCP / UDP / ICMP 的地址改写。真实 Linux namespace 的官方 tsnet / TUN / 子网 / ACL / DERP 回退与 SNAT 回归通过。Android 36 x86_64 实测 DoH、DoT、DNSSEC、MagicDNS、切网、应用分流、出口与身份切换通过；不冒充跨租户共享专项或 ARM64 真机验收。

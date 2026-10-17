@@ -16,6 +16,8 @@ pub struct Config {
     pub advertise_routes: Vec<IpNet>,
     pub accept_routes: bool,
     pub accept_dns: bool,
+    pub dns_resolvers: Vec<crate::model::DnsResolver>,
+    pub dnssec_validate: bool,
     pub exit_node_id: String,
     pub snat: bool,
     pub mtu: u16,
@@ -32,6 +34,8 @@ impl Default for Config {
             advertise_routes: Vec::new(),
             accept_routes: false,
             accept_dns: false,
+            dns_resolvers: Vec::new(),
+            dnssec_validate: false,
             exit_node_id: String::new(),
             snat: false,
             mtu: 1280,
@@ -49,6 +53,17 @@ impl Config {
 
     pub fn validate(&self) -> Result<()> {
         server_url(&self.server)?;
+        ensure!(
+            self.dns_resolvers.len() <= 3,
+            "最多设置三个自定义 DNS 解析器"
+        );
+        crate::dns::targets(&self.dns_resolvers)?;
+        ensure!(
+            (self.dns_resolvers.is_empty() && !self.dnssec_validate)
+                || self.accept_dns
+                || !self.exit_node_id.is_empty(),
+            "请先启用网络 DNS，再设置解析器或 DNSSEC"
+        );
         ensure!(
             self.exit_node_id.len() <= 128
                 && self

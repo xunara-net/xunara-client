@@ -7,8 +7,11 @@ pub mod diagnostic;
 pub mod discovery;
 pub mod dns;
 pub mod dns_stack;
+mod dns_tls;
+mod dns_validate;
 pub mod engine;
 pub mod filter;
+pub mod masquerade;
 pub mod mobile;
 pub mod model;
 #[cfg(target_os = "linux")]

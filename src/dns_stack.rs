@@ -16,6 +16,7 @@ use smoltcp::{
 };
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
+    sync::{mpsc, oneshot},
     task::JoinSet,
 };
 
@@ -75,10 +76,10 @@ impl Device for Queue {
     }
 }
 
-#[derive(Clone)]
 enum Client {
     Udp(IpEndpoint, usize),
     Tcp(usize, u64),
+    Validation(oneshot::Sender<Message>),
 }
 struct Listener {
     handle: SocketHandle,
@@ -95,6 +96,7 @@ struct Upstream {
     output: Vec<u8>,
     written: usize,
     started: Instant,
+    tls: Option<crate::dns_tls::Session>,
 }
 struct Pending {
     client: Client,
@@ -117,6 +119,8 @@ pub struct DnsProxy {
     next_id: u64,
     next_port: u16,
     started: Instant,
+    validator: crate::dns_validate::Validator,
+    validation_requests: mpsc::Receiver<crate::dns_validate::Request>,
 }
 
 impl DnsProxy {
@@ -185,6 +189,7 @@ impl DnsProxy {
                 busy: false,
             });
         }
+        let (validator, validation_requests) = crate::dns_validate::Validator::new();
         Ok(Self {
             plan,
             device,
@@ -197,6 +202,8 @@ impl DnsProxy {
             next_id: 0,
             next_port: 49152 + (OsRng.next_u32() % 8192) as u16,
             started: Instant::now(),
+            validator,
+            validation_requests,
         })
     }
 
@@ -327,10 +334,17 @@ impl DnsProxy {
         for (client, query) in requests {
             self.request(client, query);
         }
+        while let Ok(request) = self.validation_requests.try_recv() {
+            self.request(Client::Validation(request.reply), request.query);
+        }
         let mut completed = Vec::new();
         let mut failed = Vec::new();
         for (id, pending) in &mut self.pending {
             if let Some(upstream) = &mut pending.upstream {
+                if upstream.written == upstream.output.len() {
+                    upstream.output.clear();
+                    upstream.written = 0;
+                }
                 let socket = self.sockets.get_mut::<tcp::Socket>(upstream.handle);
                 if socket.can_send()
                     && upstream.written < upstream.output.len()
@@ -344,9 +358,32 @@ impl DnsProxy {
                         if length == 0 {
                             break;
                         }
-                        upstream.input.extend_from_slice(&bytes[..length]);
+                        let plain = if let Some(tls) = &mut upstream.tls {
+                            match tls.receive(&bytes[..length]) {
+                                Ok(plain) => plain,
+                                Err(_) => {
+                                    failed.push(*id);
+                                    break;
+                                }
+                            }
+                        } else {
+                            bytes[..length].to_vec()
+                        };
+                        upstream.input.extend(plain);
                         if upstream.input.len() > MAX_RESPONSE + 8192 {
                             break;
+                        }
+                    }
+                }
+                if let Some(tls) = &mut upstream.tls {
+                    if failed.contains(id) {
+                        continue;
+                    }
+                    match tls.output() {
+                        Ok(bytes) => upstream.output.extend(bytes),
+                        Err(_) => {
+                            failed.push(*id);
+                            continue;
                         }
                     }
                 }
@@ -398,21 +435,34 @@ impl DnsProxy {
         match self.plan.answer(&query) {
             Answer::Local(response) => self.respond(client, &response),
             Answer::Forward(targets) => {
-                if self.pending.len() >= LIMIT {
+                let internal = matches!(&client, Client::Validation(_));
+                if self.pending.len() >= if internal { LIMIT } else { LIMIT / 2 } {
                     self.respond(client, &dns::reply(&query, ResponseCode::ServFail));
                     return;
                 }
                 self.next_id += 1;
+                let validate = self.plan.dnssec_validate && !internal;
                 self.pending.insert(
                     self.next_id,
                     Pending {
                         client,
                         query,
-                        targets: targets.into_iter().take(3).collect(),
+                        targets: if validate {
+                            VecDeque::new()
+                        } else {
+                            targets.into_iter().take(3).collect()
+                        },
                         upstream: None,
-                        direct: false,
+                        direct: validate,
                     },
                 );
+                if validate {
+                    let validator = self.validator.clone();
+                    let id = self.next_id;
+                    let query = self.pending[&id].query.clone();
+                    self.tasks
+                        .spawn(async move { (id, validator.query(query).await) });
+                }
             }
         }
     }
@@ -441,8 +491,20 @@ impl DnsProxy {
         else {
             return;
         };
-        let Ok(output) = upstream_request(&target, &pending.query) else {
+        let Ok(mut output) = upstream_request(&target, &pending.query) else {
             return;
+        };
+        let tls = if let Target::Encrypted { name, .. } = &target {
+            let Ok(mut tls) = crate::dns_tls::Session::new(name, &output) else {
+                return;
+            };
+            let Ok(encrypted) = tls.output() else {
+                return;
+            };
+            output = encrypted;
+            Some(tls)
+        } else {
+            None
         };
         let mut socket = tcp_socket();
         let local = (IpAddress::from(*source), self.next_port);
@@ -471,6 +533,7 @@ impl DnsProxy {
             output,
             written: 0,
             started: Instant::now(),
+            tls,
         });
     }
 
@@ -491,6 +554,9 @@ impl DnsProxy {
     }
     fn respond(&mut self, client: Client, response: &Message) {
         match client {
+            Client::Validation(reply) => {
+                let _ = reply.send(response.clone());
+            }
             Client::Udp(endpoint, limit) => {
                 if let Ok(bytes) = dns::encode(response, limit) {
                     let _ = self
@@ -534,9 +600,28 @@ fn frame(bytes: &[u8]) -> Vec<u8> {
 fn upstream_request(target: &Target, query: &Message) -> Result<Vec<u8>> {
     let bytes = query.to_vec()?;
     match target {
-        Target::Dns(_) => Ok(frame(&bytes)),
-        Target::PeerHttp(address) => {
-            let mut output=format!("POST /dns-query HTTP/1.0\r\nHost: {address}\r\nContent-Type: application/dns-message\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",bytes.len()).into_bytes();
+        Target::Dns(_) | Target::Encrypted { path: None, .. } => Ok(frame(&bytes)),
+        Target::PeerHttp(_) | Target::Encrypted { path: Some(_), .. } => {
+            let (host, path) = match target {
+                Target::Encrypted {
+                    name,
+                    path: Some(path),
+                    address,
+                } => (
+                    format!(
+                        "{}:{}",
+                        if name.contains(':') {
+                            format!("[{name}]")
+                        } else {
+                            name.clone()
+                        },
+                        address.port()
+                    ),
+                    path.as_str(),
+                ),
+                _ => (target.address().to_string(), "/dns-query"),
+            };
+            let mut output=format!("POST {path} HTTP/1.0\r\nHost: {host}\r\nContent-Type: application/dns-message\r\nAccept: application/dns-message\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",bytes.len()).into_bytes();
             output.extend(bytes);
             Ok(output)
         }
@@ -545,7 +630,7 @@ fn upstream_request(target: &Target, query: &Message) -> Result<Vec<u8>> {
 fn upstream_response(target: &Target, bytes: &[u8], closed: bool) -> Result<Option<Vec<u8>>> {
     ensure!(bytes.len() <= MAX_RESPONSE + 8192, "DNS 响应超过上限");
     match target {
-        Target::Dns(_) => {
+        Target::Dns(_) | Target::Encrypted { path: None, .. } => {
             if bytes.len() < 2 {
                 ensure!(!closed, "DNS 连接提前关闭");
                 return Ok(None);
@@ -559,7 +644,7 @@ fn upstream_response(target: &Target, bytes: &[u8], closed: bool) -> Result<Opti
                 Ok(None)
             }
         }
-        Target::PeerHttp(_) => {
+        Target::PeerHttp(_) | Target::Encrypted { path: Some(_), .. } => {
             let mut headers = [httparse::EMPTY_HEADER; 32];
             let mut response = httparse::Response::new(&mut headers);
             let httparse::Status::Complete(offset) = response.parse(bytes)? else {
@@ -605,15 +690,17 @@ fn upstream_response(target: &Target, bytes: &[u8], closed: bool) -> Result<Opti
 }
 
 async fn direct(target: &Target, query: &Message) -> Result<Message> {
-    let Target::Dns(address) = target else {
+    if matches!(target, Target::PeerHttp(_)) {
         bail!("出口 DNS 只能走加密隧道");
-    };
+    }
+    let address = target.address();
     tokio::time::timeout(Duration::from_secs(4), async {
         let mut upstream = query.clone();
         upstream.metadata.id = OsRng.next_u32() as u16;
         // 普通网络 DNS 优先 UDP；连接到指定解析器并核对随机事务，截断或不可用再回退 TCP。
-        if let Ok(Ok(mut response)) =
-            tokio::time::timeout(Duration::from_secs(1), direct_udp(*address, &upstream)).await
+        if matches!(target, Target::Dns(_))
+            && let Ok(Ok(mut response)) =
+                tokio::time::timeout(Duration::from_secs(1), direct_udp(address, &upstream)).await
             && !response.metadata.truncation
         {
             response.metadata.id = query.metadata.id;
@@ -629,17 +716,33 @@ async fn direct(target: &Target, query: &Message) -> Result<Message> {
             use std::os::fd::AsRawFd;
             crate::mobile::host()?.protect(socket.as_raw_fd())?;
         }
-        let mut stream = socket.connect(*address).await?;
+        let stream = socket.connect(address).await?;
+        let mut stream: crate::transport::Stream = if let Target::Encrypted { name, .. } = target {
+            Box::new(
+                tokio_rustls::TlsConnector::from(crate::dns_tls::configuration())
+                    .connect(
+                        rustls::pki_types::ServerName::try_from(name.to_owned())?,
+                        stream,
+                    )
+                    .await?,
+            )
+        } else {
+            Box::new(stream)
+        };
         stream
             .write_all(&upstream_request(target, &upstream)?)
             .await?;
-        let length = stream.read_u16().await? as usize;
-        ensure!(length >= 12, "DNS 回包过短");
-        let mut bytes = vec![0; length];
-        stream.read_exact(&mut bytes).await?;
-        let mut response = dns::verified(&upstream, &bytes)?;
-        response.metadata.id = query.metadata.id;
-        Ok(response)
+        let mut bytes = Vec::new();
+        loop {
+            let mut buffer = [0; 4096];
+            let length = stream.read(&mut buffer).await?;
+            bytes.extend_from_slice(&buffer[..length]);
+            if let Some(bytes) = upstream_response(target, &bytes, length == 0)? {
+                let mut response = dns::verified(&upstream, &bytes)?;
+                response.metadata.id = query.metadata.id;
+                return Ok(response);
+            }
+        }
     })
     .await
     .context("DNS 上游查询超时")?
@@ -667,6 +770,53 @@ async fn direct_udp(address: std::net::SocketAddr, query: &Message) -> Result<Me
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    #[ignore = "requires public HTTPS connectivity; independently validates real DNSSEC chains"]
+    async fn real_doh_dnssec_accepts_signed_domain_and_rejects_bogus_chain() {
+        let (validator, mut requests) = crate::dns_validate::Validator::new();
+        let target = Target::Encrypted {
+            address: "1.1.1.1:443".parse().unwrap(),
+            name: "cloudflare-dns.com".into(),
+            path: Some("/dns-query".into()),
+        };
+        let worker = tokio::spawn(async move {
+            while let Some(request) = requests.recv().await {
+                let response = direct(&target, &request.query)
+                    .await
+                    .expect("public DoH transport failed");
+                let _ = request.reply.send(response);
+            }
+        });
+        let mut query = Message::query();
+        query.metadata.recursion_desired = true;
+        query.queries.push(Query::query(
+            Name::from_ascii("cloudflare.com.").unwrap(),
+            RecordType::A,
+        ));
+        let response = validator
+            .query(query.clone())
+            .await
+            .expect("real DNSSEC chain must validate");
+        assert!(response.metadata.authentic_data);
+        assert!(!response.answers.is_empty());
+        query.queries[0] = Query::query(
+            Name::from_ascii("xunara-dnssec-proof.invalid.").unwrap(),
+            RecordType::A,
+        );
+        let negative = validator
+            .query(query.clone())
+            .await
+            .expect("signed NXDOMAIN proof must validate");
+        assert_eq!(negative.metadata.response_code, ResponseCode::NXDomain);
+        assert!(negative.metadata.authentic_data);
+        query.queries[0] = Query::query(
+            Name::from_ascii("dnssec-failed.org.").unwrap(),
+            RecordType::A,
+        );
+        assert!(validator.query(query).await.is_err());
+        worker.abort();
+        let _ = worker.await;
+    }
     use crate::{config::Config as ClientConfig, model::NetworkMap};
     use hickory_proto::{
         op::Query,

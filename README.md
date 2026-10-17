@@ -6,6 +6,8 @@
 
 Android 适配层支持显式启用 VPN MagicDNS 和选择出口：DNS UDP/TCP 本地端点、设备 A/AAAA/PTR、IP 解析器与分流、出口 peerapi DNS-over-WireGuard。所选出口撤销后保留 VPN 内的阻断，LAN 优先；默认均关闭。详见 Android 仓库的 `docs/dns-exit-accounts.md`。这些选项不开放给 Linux CLI，不更改 Linux 宿主 DNS 或默认路由。
 
+Android 0.4 增加自定义 DoH / DoT 与本机 DNSSEC：域名解析器使用明确的引导 IP，校验 CA 与主机名，不使用系统解析器递归解析自己。DNSSEC 使用 Hickory 的本地签名链验证，不照抄上游 AD。加密上游失败不降级明文；出口模式仍只使用所选出口的加密隧道 DNS。
+
 **这是首版最小实现，不是官方 Tailscale 客户端的完整替代品。** 先在测试网络验证，再部署关键业务。当前外层 UDP 使用 IPv4，隧道处理 IPv4 / IPv6 的 TCP、UDP 和 ICMP；不支持 IP 分片或 IPv6 扩展头。可见节点上限 256。
 
 ## 已实现
@@ -20,6 +22,7 @@ Android 适配层支持显式启用 VPN MagicDNS 和选择出口：DNS UDP/TCP �
 - 下发 ACL / Grants 网络规则、增量规则组、端口/协议限制、出站回复状态。
 - 0700 状态目录、0600 原子身份文件、实例锁、撤销 / 过期处理、失联超时拒绝转发。
 - SIGINT / SIGTERM 关闭 TUN、清理本程序 NAT 表；状态文件不包含私钥或授权密钥。
+- 按官方 SelfNodeV4/V6MasqAddrForThisPeer 处理共享地址转换：按已认证 peer 的别名转换本机地址，并更新 IPv4 / TCP / UDP / ICMPv6 校验和，不改 Machine / Node 身份。
 
 ## 下载与启动
 
@@ -69,7 +72,7 @@ sudo xunara-client status --state-dir /var/lib/xunara-client
 
 ## 暂不支持
 
-本仓库内的 GUI、Windows / macOS、Linux 系统 MagicDNS / 默认出口、Tailnet Lock、跨租户设备共享 / 地址 masquerade、服务发布、SSH、文件传输、UDP Peer Relay、自动升级、内核 WireGuard 后端。Linux 广播子网默认路由 `/0` 仍明确拒绝。无法理解的网络协议 / 规则不会被解释成放行。
+本仓库内的 GUI、Windows / macOS、Linux 系统 MagicDNS / 默认出口、完整 Tailnet Lock、服务发布、SSH、文件传输、UDP Peer Relay、自动升级、内核 WireGuard 后端。Linux 广播子网默认路由 `/0` 仍明确拒绝。无法理解的网络协议 / 规则不会被解释成放行。启用 Tailnet Lock 的映射明确拒绝，不把未实现的本机信任根验证伪装为已支持；完整的跨租户共享仍需专项端到端验收。
 
 ## Android 平台接口
 
@@ -81,7 +84,7 @@ Android 通过 `mobile::Host` 注入系统授权后的 TUN、套接字保护、�
 
 宿主可通过有界诊断通道请求指定可见设备的 ICMP Echo。探测使用真实 WireGuard / DERP 数据面，遵循已安装路由、对端身份、来源与 ACL 校验；仅匹配本次随机 nonce 的回包，返回实际路径与往返时间。未知节点、LAN 冲突、映射过期、超时与断开均返回失败，不使用管理连接或 Disco 成功冒充业务连通。诊断不需要 root，不启动外部 `ping` 命令。
 
-移动状态同时包含设备系统、密钥到期时间、已批准子网、中继名称，以及控制面 MagicDNS 的启用 / 搜索域元信息。DNS 缺失 / null 沿用，空对象显式清空；这只是读取配置，不代表实现了手机系统 DNS 代理。
+移动状态同时包含设备系统、密钥到期时间、已批准子网、中继名称、控制面 MagicDNS 元信息和本机 DNS / DNSSEC 是否已启用。DNS 缺失 / null 沿用，空对象显式清空；只保存用户开关不等于已生效，实际状态须由运行中的 DNS 数据面给出。
 
 UDP STUN 是打洞与地址发现，**不是 UDP 业务中继**；DERP 业务回退仍通过 TLS / TCP。后续 UDP Peer Relay 必须遵循官方分配 / 授权协议，不能把裸 UDP 转发器伪装为兼容实现。
 

@@ -24,6 +24,7 @@ use crate::{
     discovery,
     dns_stack::DnsProxy,
     filter::{Filter, Packet},
+    masquerade,
     model::{NetworkMap, Node},
     network::{self, Routes, Tun},
     state::{Identity, Store, parse_key},
@@ -423,12 +424,17 @@ impl Engine {
         self.filter.outgoing(packet);
         self.sent_bytes += bytes.len() as u64;
         let mut output = vec![0; 65568];
+        let Some(bytes) = self.map.node.as_ref().and_then(|node| {
+            masquerade::outgoing(bytes, &node.addresses, &self.peers[&selected].node)
+        }) else {
+            return Ok(());
+        };
         let action = Output::from(
             self.peers
                 .get_mut(&selected)
                 .context("peer 已删除")?
                 .tunnel
-                .encapsulate(bytes, &mut output),
+                .encapsulate(&bytes, &mut output),
         );
         if let Output::Wire(bytes) = action {
             self.transmit(selected, None, &bytes).await;
@@ -620,7 +626,17 @@ impl Engine {
     async fn process(&mut self, identity: u64, path: Path, output: Output) -> Result<()> {
         match output {
             Output::Wire(bytes) => self.transmit(identity, Some(path), &bytes).await,
-            Output::Plain(bytes) => {
+            Output::Plain(mut bytes) => {
+                // 解密后的对端身份已固定；先按该 peer 还原本机地址，再做 ACL 和连接状态检查。
+                let Some(node) = self.map.node.as_ref() else {
+                    return Ok(());
+                };
+                let Some(peer) = self.peers.get(&identity) else {
+                    return Ok(());
+                };
+                if masquerade::incoming(&mut bytes, &node.addresses, &peer.node).is_none() {
+                    return Ok(());
+                }
                 if let Some(packet) = Packet::parse(&bytes)
                     && self.peers.get(&identity).is_some_and(|peer| {
                         peer.source_allowed(
@@ -885,7 +901,7 @@ impl Engine {
             "bytes_received":self.received_bytes,"bytes_sent":self.sent_bytes,"advertised_routes":self.config.advertise_routes,
             "self_name":self.map.node.as_ref().map(|node| &node.name),"key_expiry":self.map.node.as_ref().and_then(|node| node.key_expiry.as_ref()),
             "owner_login":self.map.node.as_ref().and_then(|node|self.map.user_profiles.get(&node.user)).map(|profile|&profile.login_name),
-            "dns":{"enabled":self.map.dns.proxied,"domains":self.map.dns.domains,"active":self.fresh() && self.dns.is_some(),"address":self.dns.as_ref().map(|dns|dns.plan().address)},
+            "dns":{"enabled":self.map.dns.proxied,"domains":self.map.dns.domains,"active":self.fresh() && self.dns.is_some(),"address":self.dns.as_ref().map(|dns|dns.plan().address),"dnssec_validate":self.fresh() && self.dns.as_ref().is_some_and(|dns|dns.plan().dnssec_validate)},
             "exit_node":{"selected_id":self.config.exit_node_id,"available":self.fresh() && !self.config.exit_node_id.is_empty() && self.peers.values().any(|peer|peer.node.stable_id==self.config.exit_node_id && peer.node.exit_node())},
             "devices":self.peers.values().map(|peer| json!({"id":peer.node.id.to_string(),"name":peer.node.name,"addresses":peer.node.addresses,
                 "os":peer.node.hostinfo.as_ref().map(|hostinfo| &hostinfo.os),"key_expiry":peer.node.key_expiry,"stable_id":peer.node.stable_id,"exit_node":peer.node.exit_node(),
