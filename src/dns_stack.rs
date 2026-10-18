@@ -815,12 +815,24 @@ mod tests {
     };
     use serde_json::json;
 
+    async fn dns_listeners() -> (tokio::net::UdpSocket, tokio::net::TcpListener) {
+        // TCP 和 UDP 独立分配临时端口；仅在测试端口碰撞时重新预约，不重试实际 DNS 断言。
+        for _attempt in 0..16 {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            match tokio::net::UdpSocket::bind(listener.local_addr().unwrap()).await {
+                Ok(socket) => return (socket, listener),
+                Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => {}
+                Err(error) => panic!("DNS test socket: {error}"),
+            }
+        }
+        panic!("no free dual-protocol DNS test port");
+    }
+
     #[tokio::test]
     async fn direct_dns_uses_udp_and_falls_back_to_tcp_for_truncated_answers() {
         for truncated in [false, true] {
-            let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let (socket, listener) = dns_listeners().await;
             let address = socket.local_addr().unwrap();
-            let listener = tokio::net::TcpListener::bind(address).await.unwrap();
             let task = tokio::spawn(async move {
                 let mut bytes = [0; 4096];
                 let (length, source) = socket.recv_from(&mut bytes).await.unwrap();
