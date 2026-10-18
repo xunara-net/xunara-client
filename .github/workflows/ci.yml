@@ -37,7 +37,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           repository: xunara-net/xunara-server
-          ref: dd158e973358a01f15c5e6e79c0a38d35afb3989
+          ref: fabf0991cdf27c8bff927f7928f4c8806d8a59c2
           path: xunara-server
       - uses: actions/setup-go@v5
         with:

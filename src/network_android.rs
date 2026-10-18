@@ -159,8 +159,8 @@ impl Routes {
 
 pub fn forwarding_ready(config: &Config) -> Result<()> {
     ensure!(
-        config.advertise_routes.is_empty() && !config.snat,
-        "Android 不支持子网转发"
+        !config.snat,
+        "Android 使用免 Root 用户态转发，不允许修改内核 SNAT"
     );
     Ok(())
 }

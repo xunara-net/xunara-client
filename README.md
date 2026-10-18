@@ -8,6 +8,8 @@ Android 适配层支持显式启用 VPN MagicDNS 和选择出口：DNS UDP/TCP �
 
 Android 0.4 增加自定义 DoH / DoT 与本机 DNSSEC：域名解析器使用明确的引导 IP，校验 CA 与主机名，不使用系统解析器递归解析自己。DNSSEC 使用 Hickory 的本地签名链验证，不照抄上游 AD。加密上游失败不降级明文；出口模式仍只使用所选出口的加密隧道 DNS。
 
+Android 适配层另提供免 Root 的子网 / 出口转发：只有用户请求、控制面批准与 ACL 同时允许才接收远端流量，TCP / UDP 使用有界用户态栈和受保护 socket，ICMP Echo 核对真实回包。出口 DNS 使用 WireGuard 内的官方 peerapi 服务；不在物理网卡开放代理端口。配置与验收说明见 Android 仓库的 `docs/phone-forwarding.md`。
+
 **这是首版最小实现，不是官方 Tailscale 客户端的完整替代品。** 先在测试网络验证，再部署关键业务。当前外层 UDP 使用 IPv4，隧道处理 IPv4 / IPv6 的 TCP、UDP 和 ICMP；不支持 IP 分片或 IPv6 扩展头。可见节点上限 256。
 
 ## 已实现
@@ -72,13 +74,15 @@ sudo xunara-client status --state-dir /var/lib/xunara-client
 
 ## 暂不支持
 
-本仓库内的 GUI、Windows / macOS、Linux 系统 MagicDNS / 默认出口、完整 Tailnet Lock、服务发布、SSH、文件传输、UDP Peer Relay、自动升级、内核 WireGuard 后端。Linux 广播子网默认路由 `/0` 仍明确拒绝。无法理解的网络协议 / 规则不会被解释成放行。启用 Tailnet Lock 的映射明确拒绝，不把未实现的本机信任根验证伪装为已支持；完整的跨租户共享仍需专项端到端验收。
+本仓库内的 GUI、Windows / macOS、Linux 系统 MagicDNS / 默认出口、完整 Tailnet Lock、服务发布、SSH、文件传输、UDP Peer Relay、自动升级、内核 WireGuard 后端。Linux 广播子网默认路由 `/0` 仍明确拒绝。无法理解的网络协议 / 规则不会被解释成放行。启用 Tailnet Lock 的映射明确拒绝，不把未实现的本机信任根验证伪装为已支持。跨租户共享已通过真实 Rust 路由器与 Android 的双栈别名、重叠原地址、ACL / 子网隔离、接受 / 撤销及其他用户 / 租户拒绝验收，具体环境边界见 Android 仓库的 `docs/verification.md`。
 
 ## Android 平台接口
 
 Android 通过 `mobile::Host` 注入系统授权后的 TUN、套接字保护、当前 LAN 与状态回调。`network_android` 不执行 `ip` / `nft`，不调用 `/dev/net/tun`，不引入 Android JNI 或 Flutter 依赖；宿主代码在独立应用仓库维护。
 
-移动端仅接收已批准子网，不广播路由，不要求 root，不充当子网路由器。每个 TCP / UDP 外层 socket 在使用前调用 `VpnService.protect`；TUN 只在收到授权映射后创建，地址使用 host prefix，冲突 LAN 优先，默认出口和 DNS 保持不变。界面状态不包含机器私钥或预授权密钥；详细节点状态仅经内存回调，不扩张 CLI 的磁盘状态文件。
+移动端默认只访问私网，用户可明确选择广播子网或提供出口；提供本机出口与使用其他出口互斥。所有 TCP / UDP / ICMP 外层 socket 在使用前调用 `VpnService.protect`；TUN 只在收到授权映射后创建，地址使用 host prefix，冲突 LAN 优先，默认出口和 DNS 保持不变。界面状态不包含机器私钥或预授权密钥；详细节点状态仅经内存回调，不扩张 CLI 的磁盘状态文件。
+
+转发流绑定已认证 peer 与五元组，不共享机器或账号会话；ACL、机器来源、批准路由或共享别名改变时销毁旧流。`receive_stats` 只记录聚合收包 / 拒绝计数，不记录地址、报文、密钥或业务内容；计数属于当前内核实例，不是长期审计。
 
 具体 Android 版本、APK 签名、模拟器与真机验收边界以应用仓库记录为准，不能将 Linux 发布二进制当成 Android 可执行文件。
 

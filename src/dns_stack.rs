@@ -9,7 +9,6 @@ use hickory_proto::op::{Message, ResponseCode};
 use rand_core::{OsRng, RngCore};
 use smoltcp::{
     iface::{Config, Interface, SocketHandle, SocketSet},
-    phy::{Device, DeviceCapabilities, Medium, RxToken, TxToken},
     socket::{tcp, udp},
     time::{Duration as StackDuration, Instant as StackInstant},
     wire::{HardwareAddress, IpAddress, IpCidr, IpEndpoint},
@@ -23,63 +22,18 @@ use tokio::{
 use crate::{
     dns::{self, Answer, DnsPlan, Target},
     filter::Packet,
+    packet_stack::Queue,
 };
 
 const LIMIT: usize = 64;
 const TCP_LIMIT: usize = 8;
 const MAX_RESPONSE: usize = 65535;
 
-#[derive(Default)]
-struct Queue {
-    input: VecDeque<Vec<u8>>,
-    output: VecDeque<Vec<u8>>,
-}
-struct Received(Vec<u8>);
-struct Transmit<'a>(&'a mut VecDeque<Vec<u8>>);
-
-impl RxToken for Received {
-    fn consume<Output, Function: FnOnce(&[u8]) -> Output>(self, function: Function) -> Output {
-        function(&self.0)
-    }
-}
-impl TxToken for Transmit<'_> {
-    fn consume<Output, Function: FnOnce(&mut [u8]) -> Output>(
-        self,
-        length: usize,
-        function: Function,
-    ) -> Output {
-        let mut bytes = vec![0; length];
-        let result = function(&mut bytes);
-        self.0.push_back(bytes);
-        result
-    }
-}
-impl Device for Queue {
-    type RxToken<'a> = Received;
-    type TxToken<'a> = Transmit<'a>;
-    fn receive(&mut self, _: StackInstant) -> Option<(Received, Transmit<'_>)> {
-        if self.output.len() >= 256 {
-            return None;
-        }
-        self.input
-            .pop_front()
-            .map(|bytes| (Received(bytes), Transmit(&mut self.output)))
-    }
-    fn transmit(&mut self, _: StackInstant) -> Option<Transmit<'_>> {
-        (self.output.len() < 256).then_some(Transmit(&mut self.output))
-    }
-    fn capabilities(&self) -> DeviceCapabilities {
-        let mut capabilities = DeviceCapabilities::default();
-        capabilities.medium = Medium::Ip;
-        capabilities.max_transmission_unit = 1280;
-        capabilities
-    }
-}
-
 enum Client {
     Udp(IpEndpoint, usize),
     Tcp(usize, u64),
     Validation(oneshot::Sender<Message>),
+    Api(oneshot::Sender<Message>),
 }
 struct Listener {
     handle: SocketHandle,
@@ -121,6 +75,13 @@ pub struct DnsProxy {
     started: Instant,
     validator: crate::dns_validate::Validator,
     validation_requests: mpsc::Receiver<crate::dns_validate::Request>,
+    api_sender: mpsc::Sender<ApiRequest>,
+    api_requests: mpsc::Receiver<ApiRequest>,
+}
+
+pub struct ApiRequest {
+    pub query: Message,
+    pub reply: oneshot::Sender<Message>,
 }
 
 impl DnsProxy {
@@ -190,6 +151,7 @@ impl DnsProxy {
             });
         }
         let (validator, validation_requests) = crate::dns_validate::Validator::new();
+        let (api_sender, api_requests) = mpsc::channel(32);
         Ok(Self {
             plan,
             device,
@@ -204,11 +166,17 @@ impl DnsProxy {
             started: Instant::now(),
             validator,
             validation_requests,
+            api_sender,
+            api_requests,
         })
     }
 
     pub fn plan(&self) -> &DnsPlan {
         &self.plan
+    }
+
+    pub fn api_sender(&self) -> mpsc::Sender<ApiRequest> {
+        self.api_sender.clone()
     }
 
     pub fn local(&self, bytes: &[u8]) -> bool {
@@ -336,6 +304,9 @@ impl DnsProxy {
         }
         while let Ok(request) = self.validation_requests.try_recv() {
             self.request(Client::Validation(request.reply), request.query);
+        }
+        while let Ok(request) = self.api_requests.try_recv() {
+            self.request(Client::Api(request.reply), request.query);
         }
         let mut completed = Vec::new();
         let mut failed = Vec::new();
@@ -554,7 +525,7 @@ impl DnsProxy {
     }
     fn respond(&mut self, client: Client, response: &Message) {
         match client {
-            Client::Validation(reply) => {
+            Client::Validation(reply) | Client::Api(reply) => {
                 let _ = reply.send(response.clone());
             }
             Client::Udp(endpoint, limit) => {

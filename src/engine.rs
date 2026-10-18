@@ -24,6 +24,7 @@ use crate::{
     discovery,
     dns_stack::DnsProxy,
     filter::{Filter, Packet},
+    forwarding::Forwarder,
     masquerade,
     model::{NetworkMap, Node},
     network::{self, Routes, Tun},
@@ -67,6 +68,24 @@ struct Peer {
 }
 
 impl Peer {
+    fn maintain(&mut self, scratch: &mut [u8], initial_budget: &mut u8) -> Output {
+        let action = Output::from(self.tunnel.update_timers(scratch));
+        if matches!(action, Output::Done)
+            && *initial_budget > 0
+            && self.tunnel.persistent_keepalive().is_some()
+            && self.tunnel.time_since_last_handshake().is_none()
+        {
+            // 与官方 WireGuard 启用 persistent keepalive 时相同，重连主动建立新会话。
+            // 纯接收端不能等远端旧会话过期才恢复；限额只消耗实际发出的首握手。
+            let action = Output::from(self.tunnel.format_handshake_initiation(scratch, false));
+            if matches!(action, Output::Wire(_)) {
+                *initial_budget -= 1;
+            }
+            return action;
+        }
+        action
+    }
+
     fn endpoints(&self) -> Vec<SocketAddr> {
         self.node
             .endpoints
@@ -117,6 +136,20 @@ impl Peer {
     }
 }
 
+#[derive(Default, serde::Serialize)]
+struct ReceiveStats {
+    tun_packets: u64,
+    tun_source_drops: u64,
+    dns_queries: u64,
+    encrypted_packets: u64,
+    decrypt_errors: u64,
+    decoded_packets: u64,
+    invalid_packets: u64,
+    source_drops: u64,
+    destination_drops: u64,
+    acl_drops: u64,
+}
+
 pub struct Engine {
     config: Arc<Config>,
     identity: Arc<Identity>,
@@ -143,6 +176,8 @@ pub struct Engine {
     diagnostic_input: Option<mpsc::Receiver<PingRequest>>,
     pings: Pings,
     dns: Option<DnsProxy>,
+    forwarding: Option<Forwarder>,
+    receive_stats: ReceiveStats,
 }
 
 impl Engine {
@@ -192,6 +227,8 @@ impl Engine {
             diagnostic_input: None,
             pings: Pings::default(),
             dns: None,
+            forwarding: None,
+            receive_stats: ReceiveStats::default(),
         })
     }
 
@@ -204,6 +241,7 @@ impl Engine {
         let mut packet = vec![0; 65536];
         let mut ticker = tokio::time::interval(Duration::from_secs(1));
         let mut dns_ticker = tokio::time::interval(Duration::from_millis(20));
+        dns_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             enum Event {
                 Map(Option<Box<NetworkMap>>),
@@ -226,7 +264,7 @@ impl Engine {
                     }
                 } => Event::Ping(request),
                 _ = ticker.tick() => Event::Tick,
-                _ = async { if self.dns.is_some() {dns_ticker.tick().await;} else {std::future::pending::<()>().await;} } => Event::Dns,
+                _ = async { if self.dns.is_some() || self.forwarding.is_some() {dns_ticker.tick().await;} else {std::future::pending::<()>().await;} } => Event::Dns,
             };
             match event {
                 Event::Map(map) => {
@@ -263,7 +301,10 @@ impl Engine {
                         self.status(store)?;
                     }
                 }
-                Event::Dns => self.poll_dns().await?,
+                Event::Dns => {
+                    self.poll_dns().await?;
+                    self.poll_forwarding().await?;
+                }
             }
         }
     }
@@ -281,6 +322,17 @@ impl Engine {
             "本机映射密钥不匹配或未授权"
         );
         let nodes = map.nodes()?;
+        let source_changed = self
+            .map
+            .node
+            .as_ref()
+            .is_none_or(|previous| previous.source_policy() != node.source_policy())
+            || self.peers.len() != nodes.iter().filter(|peer| peer.valid()).count()
+            || nodes.iter().filter(|peer| peer.valid()).any(|node| {
+                self.peers
+                    .get(&node.id)
+                    .is_none_or(|previous| previous.node.source_policy() != node.source_policy())
+            });
         let stable_ids = nodes
             .iter()
             .filter(|node| !node.stable_id.is_empty())
@@ -303,15 +355,32 @@ impl Engine {
         let filter = Filter::compile(&map.filter)?;
         #[cfg(target_os = "android")]
         {
+            let forwarding = crate::forwarding::Plan::new(&self.config, &map)?;
+            let reset_forwarding = self.forwarding.as_ref().map(Forwarder::plan)
+                != forwarding.as_ref()
+                || self.map.filter != map.filter
+                || !self.fresh();
+            if reset_forwarding {
+                // 路由撤销、来源 / 机器密钥或 ACL 变化时销毁旧连接和后台拨号，不能沿用旧授权。
+                self.forwarding = forwarding.map(Forwarder::new);
+            }
             let host = crate::mobile::host()?;
+            let mut dns_config = (*self.config).clone();
+            dns_config.accept_dns |= self
+                .forwarding
+                .as_ref()
+                .is_some_and(|router| router.plan().exit());
             let plan = crate::dns::DnsPlan::new(
-                &self.config,
+                &dns_config,
                 &map,
                 &host.local_networks()?,
                 &host.dns_servers()?,
             )?;
-            if self.dns.as_ref().map(DnsProxy::plan) != plan.as_ref() {
+            if self.dns.as_ref().map(DnsProxy::plan) != plan.as_ref() || reset_forwarding {
                 self.dns = plan.map(DnsProxy::new).transpose()?;
+            }
+            if let (Some(router), Some(dns)) = (&mut self.forwarding, &self.dns) {
+                router.set_dns(dns.api_sender());
             }
         }
         self.routes.apply(&self.config, &map).await?;
@@ -363,7 +432,8 @@ impl Engine {
                 },
             );
         }
-        if self.map.filter != map.filter || !self.fresh() {
+        if self.map.filter != map.filter || source_changed || !self.fresh() {
+            // IP 被重新分配或 peer 密钥 / 共享别名变化后，不把旧连接的回包许可授予新机器。
             self.filter = filter;
         }
         let mut regions = self
@@ -393,10 +463,13 @@ impl Engine {
         let Some(packet) = Packet::parse(bytes) else {
             return Ok(());
         };
+        self.receive_stats.tun_packets += 1;
         if !self.routes.local_source(packet.source) {
+            self.receive_stats.tun_source_drops += 1;
             return Ok(());
         }
         if let Some(dns) = self.dns.as_mut().filter(|dns| dns.local(bytes)) {
+            self.receive_stats.dns_queries += 1;
             dns.ingest(bytes);
             return Ok(());
         }
@@ -454,6 +527,40 @@ impl Engine {
                 } else {
                     self.outgoing(&bytes).await?;
                 }
+            }
+        }
+        Ok(())
+    }
+
+    async fn poll_forwarding(&mut self) -> Result<()> {
+        if !self.fresh() || self.peers.values().any(|peer| !peer.node.valid()) {
+            self.forwarding = None;
+            return Ok(());
+        }
+        let packets = self
+            .forwarding
+            .as_mut()
+            .map(Forwarder::poll)
+            .unwrap_or_default();
+        for (identity, bytes) in packets {
+            let Some(peer) = self
+                .peers
+                .get_mut(&identity)
+                .filter(|peer| peer.node.valid())
+            else {
+                continue;
+            };
+            let mut output = vec![0; 65568];
+            let Some(node) = self.map.node.as_ref() else {
+                continue;
+            };
+            let Some(bytes) = masquerade::outgoing(&bytes, &node.addresses, &peer.node) else {
+                continue;
+            };
+            let action = Output::from(peer.tunnel.encapsulate(&bytes, &mut output));
+            self.sent_bytes += bytes.len() as u64;
+            if let Output::Wire(bytes) = action {
+                self.transmit(identity, None, &bytes).await;
             }
         }
         Ok(())
@@ -560,7 +667,10 @@ impl Engine {
                 Some(response.receiver_idx >> 8)
             }
             boringtun::noise::Packet::PacketCookieReply(cookie) => Some(cookie.receiver_idx >> 8),
-            boringtun::noise::Packet::PacketData(packet) => Some(packet.receiver_idx >> 8),
+            boringtun::noise::Packet::PacketData(packet) => {
+                self.receive_stats.encrypted_packets += 1;
+                Some(packet.receiver_idx >> 8)
+            }
         };
         if receiver.is_none() {
             if self.budget == 0 {
@@ -592,6 +702,9 @@ impl Engine {
                 .decapsulate(source, bytes, &mut scratch);
             let action = Output::from(result);
             if matches!(action, Output::Invalid) {
+                if receiver.is_some() {
+                    self.receive_stats.decrypt_errors += 1;
+                }
                 continue;
             }
             let authenticated = match &action {
@@ -627,6 +740,7 @@ impl Engine {
         match output {
             Output::Wire(bytes) => self.transmit(identity, Some(path), &bytes).await,
             Output::Plain(mut bytes) => {
+                self.receive_stats.decoded_packets += 1;
                 // 解密后的对端身份已固定；先按该 peer 还原本机地址，再做 ACL 和连接状态检查。
                 let Some(node) = self.map.node.as_ref() else {
                     return Ok(());
@@ -635,53 +749,94 @@ impl Engine {
                     return Ok(());
                 };
                 if masquerade::incoming(&mut bytes, &node.addresses, &peer.node).is_none() {
+                    self.receive_stats.invalid_packets += 1;
                     return Ok(());
                 }
-                if let Some(packet) = Packet::parse(&bytes)
-                    && self.peers.get(&identity).is_some_and(|peer| {
-                        peer.source_allowed(
-                            packet,
-                            !self.config.exit_node_id.is_empty()
-                                && self.config.exit_node_id == peer.node.stable_id,
-                        )
-                    })
-                    && !self.peers.iter().any(|(other, peer)| {
-                        *other != identity
-                            && peer
-                                .node
-                                .addresses
-                                .iter()
-                                .any(|address| address.contains(&packet.source))
-                    })
-                    && self.routes.local_destination(packet.destination)
-                    && if self.peers[&identity]
-                        .node
-                        .addresses
-                        .iter()
-                        .chain(
-                            self.peers[&identity]
-                                .node
-                                .allowed_ips
-                                .iter()
-                                .filter(|prefix| prefix.prefix_len() > 0),
-                        )
-                        .any(|prefix| prefix.contains(&packet.source))
-                    {
-                        self.filter.incoming(packet)
-                    } else {
-                        self.filter.established(packet)
-                    }
+                let Some(packet) = Packet::parse(&bytes) else {
+                    self.receive_stats.invalid_packets += 1;
+                    return Ok(());
+                };
+                if !peer.source_allowed(
+                    packet,
+                    !self.config.exit_node_id.is_empty()
+                        && self.config.exit_node_id == peer.node.stable_id,
+                ) || self.peers.iter().any(|(other, peer)| {
+                    *other != identity
+                        && peer
+                            .node
+                            .addresses
+                            .iter()
+                            .any(|address| address.contains(&packet.source))
+                }) {
+                    self.receive_stats.source_drops += 1;
+                    return Ok(());
+                }
+                if !self.routes.local_destination(packet.destination)
+                    && !self
+                        .forwarding
+                        .as_ref()
+                        .is_some_and(|router| router.plan().handles(packet))
                 {
+                    self.receive_stats.destination_drops += 1;
+                    return Ok(());
+                }
+                let allowed = if self.peers[&identity]
+                    .node
+                    .addresses
+                    .iter()
+                    .chain(
+                        self.peers[&identity]
+                            .node
+                            .allowed_ips
+                            .iter()
+                            .filter(|prefix| prefix.prefix_len() > 0),
+                    )
+                    .any(|prefix| prefix.contains(&packet.source))
+                {
+                    if self
+                        .forwarding
+                        .as_ref()
+                        .is_some_and(|router| router.plan().peer_dns(packet))
+                    {
+                        // 与官方 peerapi 一致：出口 DNS 单独检查 autogroup:internet 探针，
+                        // 不把可见 peer 或持有 HTTP 连接误当成互联网访问授权。
+                        self.filter.permits(Packet {
+                            destination: if packet.source.is_ipv4() {
+                                "0.0.0.0"
+                            } else {
+                                "2000::"
+                            }
+                            .parse()
+                            .expect("constant address"),
+                            destination_port: 53,
+                            protocol: 6,
+                            ..packet
+                        })
+                    } else {
+                        self.filter.incoming(packet)
+                    }
+                } else {
+                    self.filter.established(packet)
+                };
+                if allowed {
                     let (path, region) = match path {
                         Path::Udp(_) => ("direct", 0),
                         Path::Derp(region) => ("relay", region),
                     };
-                    if let Some(dns) = self.dns.as_mut().filter(|dns| dns.upstream(&bytes)) {
+                    if let Some(router) = self
+                        .forwarding
+                        .as_mut()
+                        .filter(|router| router.plan().handles(packet))
+                    {
+                        router.ingest(identity, &bytes);
+                    } else if let Some(dns) = self.dns.as_mut().filter(|dns| dns.upstream(&bytes)) {
                         dns.ingest(&bytes);
                     } else if !self.pings.receive(identity, &bytes, path, region) {
                         self.tun.write(&bytes).await?;
                     }
                     self.received_bytes += bytes.len() as u64;
+                } else {
+                    self.receive_stats.acl_drops += 1;
                 }
             }
             _ => {}
@@ -784,21 +939,21 @@ impl Engine {
         self.limiter.reset_count();
         if !self.fresh() {
             self.filter = Filter::default();
+            self.forwarding = None;
             return Ok(());
         }
         let identities = self.peers.keys().copied().collect::<Vec<_>>();
         let mut scratch = vec![0; 65568];
+        let mut initial_budget = 16;
         for identity in identities {
             if !self.peers[&identity].node.valid() {
                 continue;
             }
-            let action = Output::from(
-                self.peers
-                    .get_mut(&identity)
-                    .context("peer 丢失")?
-                    .tunnel
-                    .update_timers(&mut scratch),
-            );
+            let action = self
+                .peers
+                .get_mut(&identity)
+                .context("peer 丢失")?
+                .maintain(&mut scratch, &mut initial_budget);
             if let Output::Wire(bytes) = action {
                 self.transmit(identity, None, &bytes).await;
             }
@@ -898,10 +1053,12 @@ impl Engine {
         json!({"type":"status","version":crate::VERSION,"updated_at":time::OffsetDateTime::now_utc().unix_timestamp(),
             "online":self.fresh(),"interface":self.config.interface,"addresses":self.map.node.as_ref().map(|node| &node.addresses),
             "peers":self.peers.len(),"direct_peers":self.peers.values().filter(|peer| peer.direct.is_some_and(|(_,seen)| seen.elapsed() < Duration::from_secs(25))).count(),
-            "bytes_received":self.received_bytes,"bytes_sent":self.sent_bytes,"advertised_routes":self.config.advertise_routes,
+            "bytes_received":self.received_bytes,"bytes_sent":self.sent_bytes,"advertised_routes":self.config.advertised_routes(),
+            "receive_stats":self.receive_stats,
+            "forwarding":{"requested":self.config.advertised_routes(),"active":self.fresh() && self.forwarding.is_some(),"approved":self.forwarding.as_ref().map(|router|&router.plan().routes),"flows":self.forwarding.as_ref().map_or(0,Forwarder::flows)},
             "self_name":self.map.node.as_ref().map(|node| &node.name),"key_expiry":self.map.node.as_ref().and_then(|node| node.key_expiry.as_ref()),
             "owner_login":self.map.node.as_ref().and_then(|node|self.map.user_profiles.get(&node.user)).map(|profile|&profile.login_name),
-            "dns":{"enabled":self.map.dns.proxied,"domains":self.map.dns.domains,"active":self.fresh() && self.dns.is_some(),"address":self.dns.as_ref().map(|dns|dns.plan().address),"dnssec_validate":self.fresh() && self.dns.as_ref().is_some_and(|dns|dns.plan().dnssec_validate)},
+            "dns":{"enabled":self.map.dns.proxied,"domains":self.map.dns.domains,"active":self.fresh() && self.dns.is_some() && (self.config.accept_dns || !self.config.exit_node_id.is_empty()),"address":self.dns.as_ref().map(|dns|dns.plan().address),"dnssec_validate":self.fresh() && self.dns.as_ref().is_some_and(|dns|dns.plan().dnssec_validate) && (self.config.accept_dns || !self.config.exit_node_id.is_empty())},
             "exit_node":{"selected_id":self.config.exit_node_id,"available":self.fresh() && !self.config.exit_node_id.is_empty() && self.peers.values().any(|peer|peer.node.stable_id==self.config.exit_node_id && peer.node.exit_node())},
             "devices":self.peers.values().map(|peer| json!({"id":peer.node.id.to_string(),"name":peer.node.name,"addresses":peer.node.addresses,
                 "os":peer.node.hostinfo.as_ref().map(|hostinfo| &hostinfo.os),"key_expiry":peer.node.key_expiry,"stable_id":peer.node.stable_id,"exit_node":peer.node.exit_node(),
@@ -915,6 +1072,7 @@ impl Engine {
         self.last_map = None;
         self.pings = Pings::default();
         self.dns = None;
+        self.forwarding = None;
         self.peers.clear();
         self.hub = Hub::default();
         #[cfg(target_os = "android")]
@@ -944,6 +1102,31 @@ mod tests {
             probes: VecDeque::new(),
             extra_endpoints: Vec::new(),
         }
+    }
+
+    #[test]
+    fn receive_only_peer_starts_a_bounded_handshake_without_waiting_for_old_sessions() {
+        let mut peer = exit();
+        peer.tunnel = Tunn::new([1; 32].into(), [2; 32].into(), None, Some(20), 1, None);
+        let mut scratch = [0; 1024];
+        let mut budget = 0;
+        assert!(matches!(
+            peer.maintain(&mut scratch, &mut budget),
+            Output::Done
+        ));
+        budget = 1;
+        let Output::Wire(handshake) = peer.maintain(&mut scratch, &mut budget) else {
+            panic!("new peer did not initiate a handshake");
+        };
+        assert_eq!(handshake.len(), 148);
+        assert_eq!(handshake[0], 1);
+        assert_eq!(budget, 0);
+        budget = 1;
+        assert!(matches!(
+            peer.maintain(&mut scratch, &mut budget),
+            Output::Done
+        ));
+        assert_eq!(budget, 1);
     }
 
     #[test]

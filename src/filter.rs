@@ -228,20 +228,23 @@ impl Filter {
     }
 
     pub fn incoming(&mut self, packet: Packet) -> bool {
-        self.established(packet)
-            || self.rules.iter().any(|rule| {
-                rule.protocols.contains(&packet.protocol)
-                    && rule
-                        .sources
-                        .iter()
-                        .any(|source| source.contains(packet.source))
-                    && rule.destinations.iter().any(|destination| {
-                        destination.address.contains(packet.destination)
-                            && (matches!(packet.protocol, 1 | 58)
-                                || (destination.first <= packet.destination_port
-                                    && packet.destination_port <= destination.last))
-                    })
-            })
+        self.established(packet) || self.permits(packet)
+    }
+
+    pub fn permits(&self, packet: Packet) -> bool {
+        self.rules.iter().any(|rule| {
+            rule.protocols.contains(&packet.protocol)
+                && rule
+                    .sources
+                    .iter()
+                    .any(|source| source.contains(packet.source))
+                && rule.destinations.iter().any(|destination| {
+                    destination.address.contains(packet.destination)
+                        && (matches!(packet.protocol, 1 | 58)
+                            || (destination.first <= packet.destination_port
+                                && packet.destination_port <= destination.last))
+                })
+        })
     }
 
     pub fn established(&self, packet: Packet) -> bool {

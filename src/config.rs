@@ -14,6 +14,7 @@ pub struct Config {
     pub hostname: String,
     pub listen: SocketAddr,
     pub advertise_routes: Vec<IpNet>,
+    pub advertise_exit: bool,
     pub accept_routes: bool,
     pub accept_dns: bool,
     pub dns_resolvers: Vec<crate::model::DnsResolver>,
@@ -32,6 +33,7 @@ impl Default for Config {
             hostname: "xunara-linux".into(),
             listen: "0.0.0.0:41641".parse().expect("constant socket"),
             advertise_routes: Vec::new(),
+            advertise_exit: false,
             accept_routes: false,
             accept_dns: false,
             dns_resolvers: Vec::new(),
@@ -61,6 +63,7 @@ impl Config {
         ensure!(
             (self.dns_resolvers.is_empty() && !self.dnssec_validate)
                 || self.accept_dns
+                || self.advertise_exit
                 || !self.exit_node_id.is_empty(),
             "请先启用网络 DNS，再设置解析器或 DNSSEC"
         );
@@ -74,8 +77,12 @@ impl Config {
         );
         #[cfg(target_os = "linux")]
         ensure!(
-            !self.accept_dns && self.exit_node_id.is_empty(),
+            !self.accept_dns && self.exit_node_id.is_empty() && !self.advertise_exit,
             "DNS 与出口选择仅由 Android VPN 管理；Linux 不修改系统 DNS 或默认路由"
+        );
+        ensure!(
+            !self.advertise_exit || self.exit_node_id.is_empty(),
+            "不能同时提供出口并使用另一个出口"
         );
         ensure!(self.state_dir.is_absolute(), "状态目录必须为绝对路径");
         ensure!(
@@ -113,6 +120,19 @@ impl Config {
             );
         }
         Ok(())
+    }
+
+    pub fn advertised_routes(&self) -> Vec<IpNet> {
+        let mut routes = self.advertise_routes.clone();
+        if self.advertise_exit {
+            routes.extend([
+                "0.0.0.0/0".parse::<IpNet>().expect("constant prefix"),
+                "::/0".parse::<IpNet>().expect("constant prefix"),
+            ]);
+        }
+        routes.sort();
+        routes.dedup();
+        routes
     }
 }
 

@@ -217,7 +217,9 @@ impl Client {
 
 fn hostinfo(config: &Config, region: u16) -> Value {
     json!({"Hostname":config.hostname,"OS":std::env::consts::OS,"IPNVersion":format!("xunara-client/{VERSION}"),
-        "RoutableIPs":config.advertise_routes,"ExitNodeID":config.exit_node_id,"NetInfo":{"PreferredDERP":region}})
+        "RoutableIPs":config.advertised_routes(),"ExitNodeID":config.exit_node_id,
+        "Services":if config.advertise_exit {json!([{"Proto":"peerapi4","Port":crate::forwarding::PEER_API_PORT},{"Proto":"peerapi6","Port":crate::forwarding::PEER_API_PORT}])}else{json!([])},
+        "NetInfo":{"PreferredDERP":region}})
 }
 
 pub async fn run(

@@ -2071,6 +2071,7 @@ name = "xunara-client"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "base64 0.22.1",
  "boringtun",
  "bytes",
  "crypto_box",

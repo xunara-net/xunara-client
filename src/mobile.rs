@@ -66,10 +66,7 @@ impl VpnConfiguration {
     pub fn from_map(config: &Config, map: &NetworkMap, local: &[IpNet]) -> Result<Self> {
         let node = map.node.as_ref().context("缺少本机映射")?;
         ensure!(node.valid(), "设备未授权或已过期");
-        ensure!(
-            config.advertise_routes.is_empty() && !config.snat,
-            "Android 仅接收子网路由，不提供需要 root 的子网转发"
-        );
+        ensure!(!config.snat, "Android 使用用户态转发，不修改内核 NAT");
         let addresses = node
             .addresses
             .iter()
@@ -230,7 +227,7 @@ mod tests {
     }
 
     #[test]
-    fn mobile_rejects_own_lan_overlap_and_router_mode() {
+    fn mobile_preserves_own_lan_and_rejects_kernel_snat() {
         assert!(
             VpnConfiguration::from_map(
                 &Config::default(),

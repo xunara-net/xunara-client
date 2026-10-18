@@ -34,7 +34,7 @@ import (
 )
 
 func main() {
-	mode := flag.String("mode", "fixture", "fixture | proxy | http | official | stun-vector")
+	mode := flag.String("mode", "fixture", "fixture | proxy | http | official | exit | phone | dns | stun-vector | masq-vector")
 	directory := flag.String("dir", "", "private test directory")
 	listen := flag.String("listen", "127.0.0.1:18080", "test listen address")
 	target := flag.String("target", "", "test proxy/HTTP target")
@@ -55,6 +55,8 @@ func main() {
 		err = official(ctx, *directory, *target)
 	case "exit":
 		err = officialExit(ctx, *directory)
+	case "phone":
+		err = officialPhoneProbe(ctx, *directory)
 	case "dns":
 		err = dnsFixture(ctx, *listen)
 	case "stun-vector":
@@ -130,7 +132,7 @@ func fixture(ctx context.Context, directory string) error {
 		}},
 	}}}
 	policy := filepath.Join(directory, "policy.hujson")
-	if err := os.WriteFile(policy, []byte(`{"acls":[{"action":"accept","src":["*"],"proto":"tcp","dst":["*:8088","*:5353"]},{"action":"accept","src":["*"],"proto":"udp","dst":["*:5353"]},{"action":"accept","src":["*"],"proto":"icmp","dst":["*:*"]}]}`), 0o600); err != nil {
+	if err := os.WriteFile(policy, fixturePolicy(false), 0o600); err != nil {
 		return err
 	}
 	server, err := control.New(control.Config{ServerURL: "http://127.0.0.1:18080", StateDir: filepath.Join(directory, "server"), Domain: "core.test", Nameservers: []string{"192.168.90.2:5353"}, DERPMap: derpMap, PolicyPath: policy, Logger: slog.New(slog.NewTextHandler(io.Discard, nil))})
@@ -141,7 +143,6 @@ func fixture(ctx context.Context, directory string) error {
 	if err := server.SetAddressPrefix(netip.MustParsePrefix("100.80.0.0/24")); err != nil {
 		return err
 	}
-	server.Start(ctx)
 	secret, err := state.NewPreAuthKeySecret()
 	if err != nil {
 		return err
@@ -183,11 +184,22 @@ func fixture(ctx context.Context, directory string) error {
 		http.NotFound(writer, request)
 	})
 	mux.HandleFunc("/_test/approve", func(writer http.ResponseWriter, request *http.Request) {
+		host := request.URL.Query().Get("host")
+		if host == "" {
+			host = "rust-router"
+		}
 		for _, node := range server.Store().ListNodes() {
-			if node.Hostname != "rust-router" {
+			if node.Hostname != host {
 				continue
 			}
 			body, _ := json.Marshal(map[string][]string{"approve": {"192.168.90.0/24"}})
+			if host == "android-integration" {
+				operation := "approve"
+				if request.URL.Query().Get("revoke") == "1" {
+					operation = "unapprove"
+				}
+				body, _ = json.Marshal(map[string][]string{operation: {"10.0.2.0/24", "fec0::/64"}})
+			}
 			action := httptest.NewRequest(http.MethodPost, "/api/v1/machines/"+node.StableID+"/routes", strings.NewReader(string(body)))
 			action.Header.Set("Authorization", "Bearer "+token)
 			action.Header.Set("Content-Type", "application/json")
@@ -202,8 +214,12 @@ func fixture(ctx context.Context, directory string) error {
 			writer.WriteHeader(http.StatusMethodNotAllowed)
 			return
 		}
+		host := request.URL.Query().Get("host")
+		if host == "" {
+			host = "official-exit"
+		}
 		for _, node := range server.Store().ListNodes() {
-			if node.Hostname != "official-exit" {
+			if node.Hostname != host {
 				continue
 			}
 			body, _ := json.Marshal(map[string][]string{"approve": {"0.0.0.0/0", "::/0"}})
@@ -218,6 +234,25 @@ func fixture(ctx context.Context, directory string) error {
 		}
 		http.NotFound(writer, request)
 	})
+	mux.HandleFunc("/_test/phone-policy", func(writer http.ResponseWriter, request *http.Request) {
+		if request.Method != http.MethodPost {
+			writer.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+		if err := os.WriteFile(policy, fixturePolicy(request.URL.Query().Get("deny") == "1"), 0o600); err != nil {
+			writer.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		writer.WriteHeader(http.StatusNoContent)
+	})
+	if os.Getenv("XUNARA_TEST_SHARING") == "true" {
+		cleanup, err := startSharingFixture(ctx, directory, server, derpMap, mux)
+		if err != nil {
+			return err
+		}
+		defer cleanup()
+	}
+	server.Start(ctx)
 	httpServer := &http.Server{Addr: "0.0.0.0:8080", Handler: mux, ReadHeaderTimeout: 5 * time.Second}
 	go func() { <-ctx.Done(); httpServer.Close() }()
 	return httpServer.ListenAndServe()

@@ -11,6 +11,7 @@ mod dns_tls;
 mod dns_validate;
 pub mod engine;
 pub mod filter;
+pub mod forwarding;
 pub mod masquerade;
 pub mod mobile;
 pub mod model;
@@ -19,6 +20,7 @@ pub mod network;
 #[cfg(target_os = "android")]
 #[path = "network_android.rs"]
 pub mod network;
+mod packet_stack;
 pub mod state;
 pub mod transport;
 

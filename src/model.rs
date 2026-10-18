@@ -39,6 +39,17 @@ pub struct Node {
     pub self_v6_masq: Option<Ipv6Addr>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct SourcePolicy {
+    key: String,
+    addresses: Vec<IpNet>,
+    allowed_ips: Vec<IpNet>,
+    expiry: Option<String>,
+    authorized: bool,
+    masq_v4: Option<Ipv4Addr>,
+    masq_v6: Option<Ipv6Addr>,
+}
+
 #[derive(Clone, Default, Deserialize)]
 #[serde(default, rename_all = "PascalCase")]
 pub struct Hostinfo {
@@ -55,6 +66,18 @@ pub struct Service {
 }
 
 impl Node {
+    pub(crate) fn source_policy(&self) -> SourcePolicy {
+        SourcePolicy {
+            key: self.key.clone(),
+            addresses: self.addresses.clone(),
+            allowed_ips: self.allowed_ips.clone(),
+            expiry: self.key_expiry.clone(),
+            authorized: self.valid(),
+            masq_v4: self.self_v4_masq,
+            masq_v6: self.self_v6_masq,
+        }
+    }
+
     pub fn exit_node(&self) -> bool {
         self.valid()
             && !self.stable_id.is_empty()
@@ -422,4 +445,29 @@ mod tests {
                 .is_err()
         );
     }
+}
+#[test]
+fn source_policy_changes_on_identity_routes_and_masquerade_but_not_display_or_transport() {
+    let original = Node {
+        key: "nodekey:first".into(),
+        machine_authorized: true,
+        addresses: vec!["100.80.0.1/32".parse().unwrap()],
+        ..Node::default()
+    };
+    let mut changed = original.clone();
+    changed.name = "renamed.core.test.".into();
+    changed.home_derp = 900;
+    changed.endpoints = vec!["192.0.2.1:41641".parse().unwrap()];
+    assert_eq!(original.source_policy(), changed.source_policy());
+    changed.key = "nodekey:another-machine".into();
+    assert_ne!(original.source_policy(), changed.source_policy());
+    changed = original.clone();
+    changed.allowed_ips = vec!["192.168.1.0/24".parse().unwrap()];
+    assert_ne!(original.source_policy(), changed.source_policy());
+    changed = original.clone();
+    changed.self_v4_masq = Some("100.80.9.1".parse().unwrap());
+    assert_ne!(original.source_policy(), changed.source_policy());
+    changed = original.clone();
+    changed.machine_authorized = false;
+    assert_ne!(original.source_policy(), changed.source_policy());
 }
