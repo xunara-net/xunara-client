@@ -22,6 +22,8 @@ Android 使用同一 `engine` / `control` / ACL / WireGuard / DERP，只有 `net
 
 `diagnostic` 的 ICMPv4 / ICMPv6 Echo 遵循 [RFC 792](https://www.rfc-editor.org/rfc/rfc792) / [RFC 4443](https://www.rfc-editor.org/rfc/rfc4443)。最多四条未完成请求、500ms 发起间隔、8 秒超时。应用只能传可见 peer ID，不能任意构造报文或指定外部目的地址。回包必须先经过通常的 WireGuard / peer 来源 / ACL 检查，再匹配 peer、两端地址、随机 identifier / sequence / payload、校验和；使用完成后即删除，防止重放。路径取实际收到回包的 UDP / DERP，不根据配置猜测。
 
+直连信任对齐官方 [magicsock endpoint](https://github.com/tailscale/tailscale/blob/v1.104.1/wgengine/magicsock/endpoint.go) 和 [6.5 秒信任窗口](https://github.com/tailscale/tailscale/blob/v1.104.1/wgengine/magicsock/magicsock.go)：有 Disco 的节点必须收到匹配本机未完成事务、实际目标地址和时限的 Pong，事务使用后即消耗。仅收到合法 WireGuard 包不证明回程可达，也不能延长直连窗口；否则单向 UDP 会让出口收到请求却一直向黑洞回包。没有 Disco 的纯 WireGuard 节点仍保留短暂的已认证源地址学习。窗口过期后继续发送候选 UDP 并回退到同一对端的加密 DERP；明确的本地 UDP 发送错误立即尝试 DERP。该回退不改变所选出口，不允许公网请求绕过 VPN。
+
 DNS 元信息按官方 [tailcfg.DNSConfig](https://github.com/tailscale/tailscale/blob/v1.104.1/tailcfg/tailcfg.go) 增量语义读取，不安装解析器、不添加 DNS 路由；详细设备与 DNS 列表仅留在移动回调内存中，CLI 磁盘状态不随之膨胀。
 
 ## Why

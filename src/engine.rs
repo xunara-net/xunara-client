@@ -68,6 +68,39 @@ struct Peer {
 }
 
 impl Peer {
+    fn direct_address(&self, now: Instant) -> Option<SocketAddr> {
+        let lifetime = if self.disco.is_some() {
+            Duration::from_millis(6500)
+        } else {
+            Duration::from_secs(5)
+        };
+        self.direct
+            .filter(|(_, confirmed)| now.saturating_duration_since(*confirmed) < lifetime)
+            .map(|(address, _)| address)
+    }
+
+    fn authenticated_udp(&mut self, source: SocketAddr, now: Instant) {
+        // 收到 WireGuard 只证明入站可达；Disco 节点必须用往返探测确认回程。
+        // 无 Disco 的纯 WireGuard 对端才短暂沿用已认证的源地址。
+        if self.disco.is_none() {
+            self.direct = Some((source, now));
+        }
+    }
+
+    fn confirm_pong(&mut self, source: SocketAddr, transaction: &[u8], now: Instant) -> bool {
+        let Some(position) = self.probes.iter().position(|(expected, target, sent)| {
+            expected.as_slice() == transaction
+                && *target == source
+                && now.saturating_duration_since(*sent) < Duration::from_secs(10)
+        }) else {
+            return false;
+        };
+        // 消耗已匹配的事务，重放的 Pong 不能再次延长直连信任。
+        self.probes.remove(position);
+        self.direct = Some((source, now));
+        true
+    }
+
     fn maintain(&mut self, scratch: &mut [u8], initial_budget: &mut u8) -> Output {
         let action = Output::from(self.tunnel.update_timers(scratch));
         if matches!(action, Output::Done)
@@ -610,18 +643,18 @@ impl Engine {
         if let Some(path) = path {
             match path {
                 Path::Udp(address) => {
-                    let _ = self.socket.send_to(bytes, address).await;
+                    if self.socket.send_to(bytes, address).await.is_err() {
+                        self.hub.send(peer.node.relay_region(), peer.key, bytes);
+                    }
                 }
                 Path::Derp(region) => self.hub.send(region, peer.key, bytes),
             }
             return;
         }
-        if let Some((address, last)) = peer
-            .direct
-            .filter(|(_, last)| last.elapsed() < Duration::from_secs(25))
-        {
-            let _ = last;
-            let _ = self.socket.send_to(bytes, address).await;
+        if let Some(address) = peer.direct_address(Instant::now()) {
+            if self.socket.send_to(bytes, address).await.is_err() {
+                self.hub.send(peer.node.relay_region(), peer.key, bytes);
+            }
         } else {
             for address in peer.endpoints() {
                 let _ = self.socket.send_to(bytes, address).await;
@@ -714,8 +747,10 @@ impl Engine {
                 Output::Invalid => false,
             };
             if authenticated && let Path::Udp(address) = path {
-                self.peers.get_mut(&identity).context("peer 丢失")?.direct =
-                    Some((address, Instant::now()));
+                self.peers
+                    .get_mut(&identity)
+                    .context("peer 丢失")?
+                    .authenticated_udp(address, Instant::now());
             }
             self.process(identity, path, action).await?;
             for _ in 0..256 {
@@ -884,13 +919,7 @@ impl Engine {
                 }
             }
             (2, Path::Udp(source)) if message.len() >= 32 => {
-                if peer.probes.iter().any(|(transaction, target, sent)| {
-                    transaction.as_slice() == &message[2..14]
-                        && *target == source
-                        && sent.elapsed() < Duration::from_secs(10)
-                }) {
-                    peer.direct = Some((source, Instant::now()));
-                }
+                peer.confirm_pong(source, &message[2..14], Instant::now());
             }
             (3, Path::Derp(_)) => {
                 let (addresses, remainder) = message[2..].as_chunks::<18>();
@@ -1050,9 +1079,10 @@ impl Engine {
     }
 
     pub fn snapshot(&self) -> serde_json::Value {
+        let now = Instant::now();
         json!({"type":"status","version":crate::VERSION,"updated_at":time::OffsetDateTime::now_utc().unix_timestamp(),
             "online":self.fresh(),"interface":self.config.interface,"addresses":self.map.node.as_ref().map(|node| &node.addresses),
-            "peers":self.peers.len(),"direct_peers":self.peers.values().filter(|peer| peer.direct.is_some_and(|(_,seen)| seen.elapsed() < Duration::from_secs(25))).count(),
+            "peers":self.peers.len(),"direct_peers":self.peers.values().filter(|peer| peer.direct_address(now).is_some()).count(),
             "bytes_received":self.received_bytes,"bytes_sent":self.sent_bytes,"advertised_routes":self.config.advertised_routes(),
             "receive_stats":self.receive_stats,
             "forwarding":{"requested":self.config.advertised_routes(),"active":self.fresh() && self.forwarding.is_some(),"approved":self.forwarding.as_ref().map(|router|&router.plan().routes),"flows":self.forwarding.as_ref().map_or(0,Forwarder::flows)},
@@ -1063,7 +1093,7 @@ impl Engine {
             "devices":self.peers.values().map(|peer| json!({"id":peer.node.id.to_string(),"name":peer.node.name,"addresses":peer.node.addresses,
                 "os":peer.node.hostinfo.as_ref().map(|hostinfo| &hostinfo.os),"key_expiry":peer.node.key_expiry,"stable_id":peer.node.stable_id,"exit_node":peer.node.exit_node(),
                 "routes":peer.node.allowed_ips.iter().filter(|prefix| prefix.prefix_len()>0 && prefix.prefix_len() < if prefix.addr().is_ipv4(){32}else{128}).collect::<Vec<_>>(),
-                "authorized":peer.node.valid(),"path":if peer.direct.is_some_and(|(_,seen)| seen.elapsed()<Duration::from_secs(25)){"direct"}else{"relay"},
+                "authorized":peer.node.valid(),"path":if peer.direct_address(now).is_some(){"direct"}else{"relay"},
                 "relay_name":self.map.derp.regions.get(&peer.node.relay_region()).map(|region| if region.region_name.is_empty(){&region.region_code}else{&region.region_name}),
                 "relay_region":peer.node.relay_region()})).collect::<Vec<_>>()})
     }
@@ -1102,6 +1132,53 @@ mod tests {
             probes: VecDeque::new(),
             extra_endpoints: Vec::new(),
         }
+    }
+
+    #[test]
+    fn disco_peers_never_trust_or_renew_a_return_path_from_incoming_wireguard_alone() {
+        let mut peer = exit();
+        peer.disco = Some([3; 32]);
+        let source = "192.0.2.10:41641".parse().unwrap();
+        let now = Instant::now();
+        peer.authenticated_udp(source, now);
+        assert_eq!(peer.direct_address(now), None);
+        peer.direct = Some((source, now));
+        peer.authenticated_udp(source, now + Duration::from_secs(6));
+        assert_eq!(peer.direct_address(now + Duration::from_millis(6500)), None);
+        let other = "192.0.2.11:41641".parse().unwrap();
+        peer.authenticated_udp(other, now + Duration::from_secs(7));
+        assert_eq!(peer.direct, Some((source, now)));
+    }
+
+    #[test]
+    fn pong_requires_a_fresh_single_use_transaction_and_its_actual_udp_target() {
+        let mut peer = exit();
+        peer.disco = Some([3; 32]);
+        let target = "192.0.2.10:41641".parse().unwrap();
+        let other = "192.0.2.11:41641".parse().unwrap();
+        let now = Instant::now();
+        peer.probes.push_back(([7; 12], target, now));
+        assert!(!peer.confirm_pong(other, &[7; 12], now));
+        assert!(!peer.confirm_pong(target, &[8; 12], now));
+        assert_eq!(peer.direct_address(now), None);
+        assert!(peer.confirm_pong(target, &[7; 12], now));
+        assert!(peer.probes.is_empty());
+        assert_eq!(peer.direct_address(now), Some(target));
+        assert!(!peer.confirm_pong(target, &[7; 12], now + Duration::from_secs(1)));
+        assert_eq!(peer.direct, Some((target, now)));
+        assert_eq!(peer.direct_address(now + Duration::from_millis(6500)), None);
+        peer.probes.push_back(([9; 12], target, now));
+        assert!(!peer.confirm_pong(target, &[9; 12], now + Duration::from_secs(10)));
+    }
+
+    #[test]
+    fn wireguard_only_peers_keep_a_short_authenticated_endpoint_without_disco() {
+        let mut peer = exit();
+        let source = "192.0.2.10:41641".parse().unwrap();
+        let now = Instant::now();
+        peer.authenticated_udp(source, now);
+        assert_eq!(peer.direct_address(now), Some(source));
+        assert_eq!(peer.direct_address(now + Duration::from_secs(5)), None);
     }
 
     #[test]

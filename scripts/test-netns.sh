@@ -5,6 +5,7 @@ umask 077
 root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 binary=${XUNARA_CLIENT_BINARY:-$root/target/release/xunara-client}
 fixture=${XUNARA_COMPAT_FIXTURE:-$root/target/compat-fixture}
+command -v nft >/dev/null || { echo 'The network regression test requires nftables for an isolated one-way UDP drop' >&2; exit 1; }
 if [ "${1:-}" != --inside ]; then
     [ -x "$binary" ] && [ -x "$fixture" ] || { echo 'Build release binary and tests/compat fixture first' >&2; exit 1; }
     exec unshare --user --map-root-user --net --mount sh "$0" --inside
@@ -111,6 +112,21 @@ until [ "$(fetch "http://$official_ip:8088" 2>/dev/null || :)" = official-core-o
     attempt=$((attempt+1)); [ "$attempt" -lt 30 ] || exit 1; sleep 1
 done
 printf 'PASS Rust to official Go tsnet peer\n'
+[ "$(fetch "http://$router_ip:8088" 2>/dev/null || :)" = xunara-core-ok ] || exit 1
+nsenter -t "$router" -n nft create table inet xunara_test_oneway
+nsenter -t "$router" -n nft add chain inet xunara_test_oneway output '{ type filter hook output priority 0; policy accept; }'
+nsenter -t "$router" -n nft add rule inet xunara_test_oneway output meta l4proto udp counter drop
+started=$(date +%s)
+deadline=$((started + 15))
+until [ "$(fetch "http://$router_ip:8088" 2>/dev/null || :)" = xunara-core-ok ]; do
+    [ "$(date +%s)" -lt "$deadline" ] || { echo 'DERP fallback failed with one-way UDP; incoming packets must not renew an unverified return path' >&2; exit 1; }
+    sleep 0.2
+done
+printf 'PASS one-way UDP: encrypted TCP recovers through DERP in %ss without trusting incoming-only reachability\n' "$(($(date +%s) - started))"
+nsenter -t "$router" -n nft list table inet xunara_test_oneway >"$directory/oneway-firewall.log"
+grep -Eq 'counter packets [1-9][0-9]* bytes' "$directory/oneway-firewall.log" || { echo 'One-way UDP test did not drop any packets' >&2; exit 1; }
+nsenter -t "$router" -n nft delete table inet xunara_test_oneway
+nsenter -t "$client" -n ping -c 2 -W 2 "$router_ip" >"$directory/ping-after-one-way.log"
 for process in $router $client; do
     nsenter -t "$process" -n ip rule add priority 50 ipproto udp blackhole
 done
