@@ -113,4 +113,6 @@ sh scripts/test-netns.sh
 
 测试使用独立 user / network namespace、两台 Rust 节点和独立 LAN：验证注册、加密 TCP / ICMP、拒绝端口、审批后的子网转发、与官方 Go tsnet 双向通信、阻断 UDP 后的证书 pin DERP 回退及恢复。安装了 nftables 时可用 `XUNARA_TEST_SNAT=true sh scripts/test-netns.sh` 复测无 LAN 回程路由的 SNAT 场景。不创建生产账号，不修改宿主机路由 / sysctl / DNS。需要允许 unprivileged user namespace；受限 CI 可在隔离 namespace 内用 root 执行 `--inside`。
 
+双安卓公网出口专项由相邻 `xunara-android/scripts/test-android-exit-pair.sh` 编排。fixture 的 `XUNARA_TEST_ANDROID_PAIR=true` 仅用于该隔离测试：使用默认放行策略和 `114.114.114.114` / `1.1.1.1`，由两台安卓之间的真实 WireGuard / DERP 转发验证公网 IP 与 DNS，而不是返回测试域名的固定答案。此模式启动监听前检查 rootless 用户映射和仅有回环网卡的独立网络，拒绝在宿主启动无认证测试入口；生产客户端不读取该开关。
+
 静态双架构发布构建：`sh scripts/build-release.sh v0.1.0 /tmp/xunara-client-release`。详见 [架构与边界](docs/architecture.md) 和 [安全说明](SECURITY.md)。

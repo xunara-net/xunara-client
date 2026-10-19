@@ -110,6 +110,17 @@ func fixture(ctx context.Context, directory string) error {
 	if directory == "" {
 		return errors.New("private test directory required")
 	}
+	androidPair := os.Getenv("XUNARA_TEST_ANDROID_PAIR") == "true"
+	if androidPair {
+		mapping, err := os.ReadFile("/proc/self/uid_map")
+		fields := strings.Fields(string(mapping))
+		interfaces, networkErr := net.Interfaces()
+		// 无认证的专项审批入口只能在新建的 rootless 网络中监听，不能暴露在宿主 LAN。
+		if err != nil || os.Geteuid() != 0 || len(fields) != 3 || fields[0] != "0" || fields[1] == "0" || fields[2] != "1" ||
+			networkErr != nil || len(interfaces) != 1 || interfaces[0].Name != "lo" {
+			return errors.New("Android pair fixture requires an isolated user/network namespace")
+		}
+	}
 	if err := os.MkdirAll(directory, 0o700); err != nil {
 		return err
 	}
@@ -132,10 +143,15 @@ func fixture(ctx context.Context, directory string) error {
 		}},
 	}}}
 	policy := filepath.Join(directory, "policy.hujson")
-	if err := os.WriteFile(policy, fixturePolicy(false), 0o600); err != nil {
+	nameservers := []string{"192.168.90.2:5353"}
+	if androidPair {
+		// 保持与待诊断租户相同的默认放行和公网 DNS，不能用假域名响应代替公网验收。
+		policy = ""
+		nameservers = []string{"114.114.114.114", "1.1.1.1"}
+	} else if err := os.WriteFile(policy, fixturePolicy(false), 0o600); err != nil {
 		return err
 	}
-	server, err := control.New(control.Config{ServerURL: "http://127.0.0.1:18080", StateDir: filepath.Join(directory, "server"), Domain: "core.test", Nameservers: []string{"192.168.90.2:5353"}, DERPMap: derpMap, PolicyPath: policy, Logger: slog.New(slog.NewTextHandler(io.Discard, nil))})
+	server, err := control.New(control.Config{ServerURL: "http://127.0.0.1:18080", StateDir: filepath.Join(directory, "server"), Domain: "core.test", Nameservers: nameservers, DERPMap: derpMap, PolicyPath: policy, Logger: slog.New(slog.NewTextHandler(io.Discard, nil))})
 	if err != nil {
 		return err
 	}
