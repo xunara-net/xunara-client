@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"golang.org/x/net/dns/dnsmessage"
+	_ "tailscale.com/feature/capture"
 	"tailscale.com/ipn"
 	"tailscale.com/ipn/ipnstate"
 	"tailscale.com/tailcfg"
@@ -26,10 +27,11 @@ import (
 // 现网专项必须单独提供短期机器凭据；不能复用手机私钥、管理员令牌或人类会话。
 func liveProbe(ctx context.Context, directory string) error {
 	var configuration struct {
-		Server string               `json:"server"`
-		Host   string               `json:"hostname"`
-		ExitID tailcfg.StableNodeID `json:"exit_id"`
-		Prefix netip.Prefix         `json:"expected_ipv4_prefix"`
+		Server  string               `json:"server"`
+		Host    string               `json:"hostname"`
+		ExitID  tailcfg.StableNodeID `json:"exit_id"`
+		Prefix  netip.Prefix         `json:"expected_ipv4_prefix"`
+		Capture bool                 `json:"capture"`
 	}
 	if directory == "" {
 		return errors.New("live diagnostics require a private directory")
@@ -84,6 +86,27 @@ func liveProbe(ctx context.Context, directory string) error {
 	if err != nil {
 		return err
 	}
+	if configuration.Capture {
+		captureFile, err := os.OpenFile(filepath.Join(directory, "traffic.pcap"), os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+		if err != nil {
+			return err
+		}
+		capture, err := client.StreamDebugCapture(ctx)
+		if err != nil {
+			captureFile.Close()
+			return err
+		}
+		finished := make(chan struct{})
+		go func() {
+			defer close(finished)
+			_, _ = io.Copy(captureFile, io.LimitReader(capture, 8<<20))
+		}()
+		defer func() {
+			capture.Close()
+			<-finished
+			captureFile.Close()
+		}()
+	}
 	for _, peer := range status.Peer {
 		emit("peer", map[string]any{"id": peer.ID, "host": peer.HostName, "online": peer.Online,
 			"exit": peer.ExitNodeOption, "peerapi": peer.PeerAPIURL, "allowed": peer.AllowedIPs})
@@ -133,7 +156,13 @@ func liveProbe(ctx context.Context, directory string) error {
 		if err != nil {
 			return err
 		}
-		response, requestErr := httpClient.Do(request)
+		targetClient := httpClient
+		if strings.HasPrefix(target, "http://") {
+			direct := *httpClient
+			direct.CheckRedirect = func(_ *http.Request, _ []*http.Request) error { return http.ErrUseLastResponse }
+			targetClient = &direct
+		}
+		response, requestErr := targetClient.Do(request)
 		result := map[string]any{"target": target, "ok": false}
 		if requestErr == nil {
 			payload, readErr := io.ReadAll(io.LimitReader(response.Body, 1<<20))

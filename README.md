@@ -122,3 +122,11 @@ sh scripts/test-netns.sh
 `target/compat-fixture -mode live-probe -dir <私有目录>` 可用于获授权的现网出口专项诊断。目录权限必须为 0700，`auth-key` 必须为 0600 普通文件，使用单独签发的短期、单次、临时设备密钥；不得借用手机私钥、人类会话或平台管理员令牌。目录内 `live.json` 包含 `server`（HTTPS 根地址）、`hostname`（本轮唯一诊断设备名）、`exit_id`（指定出口 stable ID）、`expected_ipv4_prefix`（预期租户网段）。工具验证租户地址和出口批准状态，只改变临时设备自己的偏好，不改宿主路由；分别记录两族隧道、出口 DNS、默认 HTTPS 与强制 IPv4 / IPv6 结果。诊断完成不表示检查全部成功，需逐项阅读结果；结束删除本轮临时节点、密钥及私有身份目录，不公开原始凭据。
 
 静态双架构发布构建：`sh scripts/build-release.sh v0.1.0 /tmp/xunara-client-release`。详见 [架构与边界](docs/architecture.md) 和 [安全说明](SECURITY.md)。
+
+### 现网分层诊断
+
+`live-probe` 的 `live.json` 可显式设置 `"capture": true`，通过固定 Tailscale v1.104.1 的 LocalAPI 捕获临时节点自己的隧道报文；最多 8 MiB，独占创建 0600 的 `traffic.pcap`。其中可能包含解密后的测试数据，只能保存在私有目录，不得作为发布附件或上传 Git。普通运行默认不抓包。纯 IP HTTP 探针不跟随重定向，避免将重定向后的 DNS 故障误认为原始 IP 不可达。
+
+`web-probe -listen <VPN-DNS-IP:53> -target <预先解析的公网IPv4>` 用于隔离 DNS 与出口 TCP 故障：仍请求固定的 `https://example.com/`，校验原主机名和系统 CA，只将物理目标替换为操作者事先核对的公网 IPv4，拒绝跳转到其他 HTTPS 来源。成功输出中的 `pre_resolved=true` **不代表 VPN DNS 正常**；必须另跑不带 `-target` 的原始 DNS / HTTPS 验收。
+
+`XUNARA_LIVE_DERP_CONFIG=<配置文件路径> cargo test --locked --test live_transport -- --ignored --nocapture` 单独验证 DERP TCP / TLS、HTTP Upgrade 和服务端握手头；配置文件包含 `url`（HTTPS `/derp` 地址）与 `certificate`（可信映射的证书名或指纹）。它不注册设备、不修改路由，也不能用其成功代替机器准入、WireGuard 或出口业务验收。

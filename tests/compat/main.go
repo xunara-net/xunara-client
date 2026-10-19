@@ -60,7 +60,7 @@ func main() {
 	case "dns":
 		err = dnsFixture(ctx, *listen)
 	case "web-probe":
-		err = webProbe(ctx, *listen)
+		err = webProbe(ctx, *listen, *target)
 	case "live-probe":
 		err = liveProbe(ctx, *directory)
 	case "stun-vector":
@@ -82,7 +82,7 @@ func main() {
 	}
 }
 
-func webProbe(ctx context.Context, dnsAddress string) error {
+func webProbe(ctx context.Context, dnsAddress, resolvedIPv4 string) error {
 	if _, err := netip.ParseAddrPort(dnsAddress); err != nil {
 		return errors.New("web probe requires a numeric VPN DNS endpoint")
 	}
@@ -94,6 +94,19 @@ func webProbe(ctx context.Context, dnsAddress string) error {
 		},
 	}}
 	transport := &http.Transport{DialContext: dialer.DialContext, TLSHandshakeTimeout: 8 * time.Second}
+	if resolvedIPv4 != "" {
+		address, err := netip.ParseAddr(resolvedIPv4)
+		if err != nil || !address.Is4() || !address.IsGlobalUnicast() || address.IsPrivate() {
+			return errors.New("pre-resolved HTTPS probe requires a public IPv4 address")
+		}
+		transport.DialContext = func(ctx context.Context, _ string, destination string) (net.Conn, error) {
+			host, port, err := net.SplitHostPort(destination)
+			if err != nil || host != "example.com" || port != "443" {
+				return nil, errors.New("pre-resolved probe refused another HTTPS origin")
+			}
+			return dialer.DialContext(ctx, "tcp4", net.JoinHostPort(address.String(), port))
+		}
+	}
 	defer transport.CloseIdleConnections()
 	client := &http.Client{Transport: transport, Timeout: 20 * time.Second, CheckRedirect: func(request *http.Request, previous []*http.Request) error {
 		if request.URL.Scheme != "https" || len(previous) >= 3 {
@@ -117,7 +130,7 @@ func webProbe(ctx context.Context, dnsAddress string) error {
 	if response.StatusCode != http.StatusOK || response.TLS == nil || len(response.TLS.VerifiedChains) == 0 || len(body) == 0 {
 		return errors.New("web probe did not receive an authenticated HTTPS page")
 	}
-	fmt.Printf("PASS verified HTTPS status=%d bytes=%d\n", response.StatusCode, len(body))
+	fmt.Printf("PASS verified HTTPS status=%d bytes=%d pre_resolved=%t\n", response.StatusCode, len(body), resolvedIPv4 != "")
 	return nil
 }
 
