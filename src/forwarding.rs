@@ -314,6 +314,14 @@ impl Forwarder {
         let Ok(mut stack) = Stack::new(packet) else {
             return;
         };
+        if packet.protocol == 6 && !self.plan.peer_dns(packet) {
+            // 与官方用户态转发一致：物理连接成功后才回复 SYN-ACK。
+            // 否则不可达 IPv6 会假报连接成功，阻止应用回退到可用的 IPv4。
+            stack
+                .sockets
+                .get_mut::<tcp::Socket>(stack.handle)
+                .pause_synack(true);
+        }
         stack.device.input.push_back(bytes.to_vec());
         stack.poll(self.now());
         let Some(id) = self.next_id.checked_add(1) else {
@@ -376,7 +384,13 @@ impl Forwarder {
                 && let Backend::Tcp { stream, .. } = &mut flow.backend
             {
                 match result {
-                    Ok(connected) => *stream = Some(connected),
+                    Ok(connected) => {
+                        *stream = Some(connected);
+                        flow.stack
+                            .sockets
+                            .get_mut::<tcp::Socket>(flow.stack.handle)
+                            .pause_synack(false);
+                    }
                     Err(_) => flow
                         .stack
                         .sockets
@@ -516,7 +530,9 @@ impl Forwarder {
                     } else {
                         180
                     };
-                    socket.is_open() && flow.seen.elapsed() < Duration::from_secs(idle)
+                    socket.is_open()
+                        && !socket.is_listening()
+                        && flow.seen.elapsed() < Duration::from_secs(idle)
                 }
                 Backend::Udp { socket, pending } => {
                     let endpoint = (IpAddress::from(packet.source), packet.source_port);
@@ -1040,6 +1056,65 @@ mod tests {
             let answer = hickory_proto::op::Message::from_vec(&response[start..]).unwrap();
             assert_eq!(answer.metadata.id, 1234);
             assert!(!answer.answers.is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn tcp_waits_for_real_backend_before_accepting_and_rejects_failed_dials() {
+        for address in ["127.0.0.1:0", "[::1]:0"] {
+            let unavailable = if address.starts_with('[') {
+                TcpSocket::new_v6().unwrap()
+            } else {
+                TcpSocket::new_v4().unwrap()
+            };
+            unavailable.bind(address.parse().unwrap()).unwrap();
+            let target = unavailable.local_addr().unwrap();
+            let (_, mut client) = client(target, 6);
+            let mut router = private_test_router(target.ip());
+            client.poll(router.now());
+            for bytes in client.device.output.drain(..) {
+                router.ingest(7, &bytes);
+            }
+            for (_, bytes) in router.poll() {
+                let offset = if target.is_ipv4() {
+                    usize::from(bytes[0] & 15) * 4
+                } else {
+                    40
+                };
+                assert_ne!(
+                    bytes[offset + 13] & 0x12,
+                    0x12,
+                    "SYN-ACK before physical connect"
+                );
+                client.device.input.push_back(bytes);
+            }
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while Instant::now() < deadline && router.flows() > 0 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+                for (_, bytes) in router.poll() {
+                    let offset = if target.is_ipv4() {
+                        usize::from(bytes[0] & 15) * 4
+                    } else {
+                        40
+                    };
+                    assert_ne!(
+                        bytes[offset + 13] & 0x12,
+                        0x12,
+                        "failed backend advertised success"
+                    );
+                    client.device.input.push_back(bytes);
+                }
+                client.poll(router.now());
+                assert_ne!(
+                    client.sockets.get::<tcp::Socket>(client.handle).state(),
+                    tcp::State::Established
+                );
+            }
+            assert_eq!(router.flows(), 0);
+            assert_eq!(
+                client.sockets.get::<tcp::Socket>(client.handle).state(),
+                tcp::State::Closed
+            );
         }
     }
 

@@ -10,6 +10,8 @@ Android 0.4 增加自定义 DoH / DoT 与本机 DNSSEC：域名解析器使用�
 
 Android 适配层另提供免 Root 的子网 / 出口转发：只有用户请求、控制面批准与 ACL 同时允许才接收远端流量，TCP / UDP 使用有界用户态栈和受保护 socket，ICMP Echo 核对真实回包。出口 DNS 使用 WireGuard 内的官方 peerapi 服务；不在物理网卡开放代理端口。配置与验收说明见 Android 仓库的 `docs/phone-forwarding.md`。
 
+TCP 转发只有在真实物理连接成功后才完成隧道内握手，失败时拒绝连接；不会提前发送 SYN-ACK。这样出口没有可用 IPv6 时，支持双栈回退的应用仍能尝试经同一出口访问 IPv4，不会把连接失败拖到 TLS 阶段；这不等于出口失效后允许手机直连。
+
 **这是首版最小实现，不是官方 Tailscale 客户端的完整替代品。** 先在测试网络验证，再部署关键业务。当前外层 UDP 使用 IPv4，隧道处理 IPv4 / IPv6 的 TCP、UDP 和 ICMP；不支持 IP 分片或 IPv6 扩展头。可见节点上限 256。
 
 ## 已实现
@@ -116,5 +118,7 @@ sh scripts/test-netns.sh
 双安卓公网出口专项由相邻 `xunara-android/scripts/test-android-exit-pair.sh` 编排。fixture 的 `XUNARA_TEST_ANDROID_PAIR=true` 仅用于该隔离测试：使用默认放行策略和 `114.114.114.114` / `1.1.1.1`，由两台安卓之间的真实 WireGuard / DERP 转发验证公网 IP 与 DNS，而不是返回测试域名的固定答案。此模式启动监听前检查 rootless 用户映射和仅有回环网卡的独立网络，拒绝在宿主启动无认证测试入口；生产客户端不读取该开关。
 
 该专项另需 `(cd tests/compat && CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags='-s -w' -o ../../target/compat-web-probe .)`。测试 helper 的 `web-probe` 模式由 x86_64 模拟器的 shell UID 临时执行，经过 VPN DNS 解析及出口下载真实 HTTPS 页面，并按系统 CA 校验证书链和主机名；它不是生产客户端或 Go sidecar，不进入 APK。
+
+`target/compat-fixture -mode live-probe -dir <私有目录>` 可用于获授权的现网出口专项诊断。目录权限必须为 0700，`auth-key` 必须为 0600 普通文件，使用单独签发的短期、单次、临时设备密钥；不得借用手机私钥、人类会话或平台管理员令牌。目录内 `live.json` 包含 `server`（HTTPS 根地址）、`hostname`（本轮唯一诊断设备名）、`exit_id`（指定出口 stable ID）、`expected_ipv4_prefix`（预期租户网段）。工具验证租户地址和出口批准状态，只改变临时设备自己的偏好，不改宿主路由；分别记录两族隧道、出口 DNS、默认 HTTPS 与强制 IPv4 / IPv6 结果。诊断完成不表示检查全部成功，需逐项阅读结果；结束删除本轮临时节点、密钥及私有身份目录，不公开原始凭据。
 
 静态双架构发布构建：`sh scripts/build-release.sh v0.1.0 /tmp/xunara-client-release`。详见 [架构与边界](docs/architecture.md) 和 [安全说明](SECURITY.md)。

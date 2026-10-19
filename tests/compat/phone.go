@@ -194,6 +194,13 @@ func officialPhoneProbe(ctx context.Context, directory string) error {
 			}
 		case "denied-port":
 			result["blocked"] = !tcpProbe(probe, "10.0.2.2", "18089")
+		case "family-fallback":
+			connection, err := server.Dial(probe, "tcp6", "dual-stack.public.test:18088")
+			result["ipv6_rejected"] = err != nil
+			if connection != nil {
+				connection.Close()
+			}
+			result["fallback"] = tcpProbe(probe, "dual-stack.public.test", "18088")
 		case "blocked":
 			result["blocked"] = !tcpProbe(probe, "10.0.2.2", "18088")
 		default:

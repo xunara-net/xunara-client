@@ -87,11 +87,17 @@ func dnsAnswer(bytes []byte) ([]byte, error) {
 		response.RCode = dnsmessage.RCodeNameError
 	} else {
 		header := dnsmessage.ResourceHeader{Name: question.Name, Type: question.Type, Class: dnsmessage.ClassINET, TTL: 5}
+		ipv4 := [4]byte{203, 0, 113, 77}
+		ipv6 := netip.MustParseAddr("2001:db8::77")
+		if question.Name.String() == "dual-stack.public.test." {
+			ipv4 = [4]byte{10, 0, 2, 2}
+			ipv6 = netip.MustParseAddr("fd00:dead:beef::1")
+		}
 		switch question.Type {
 		case dnsmessage.TypeA:
-			response.Answers = []dnsmessage.Resource{{Header: header, Body: &dnsmessage.AResource{A: [4]byte{203, 0, 113, 77}}}}
+			response.Answers = []dnsmessage.Resource{{Header: header, Body: &dnsmessage.AResource{A: ipv4}}}
 		case dnsmessage.TypeAAAA:
-			response.Answers = []dnsmessage.Resource{{Header: header, Body: &dnsmessage.AAAAResource{AAAA: netip.MustParseAddr("2001:db8::77").As16()}}}
+			response.Answers = []dnsmessage.Resource{{Header: header, Body: &dnsmessage.AAAAResource{AAAA: ipv6.As16()}}}
 		}
 	}
 	return response.Pack()

@@ -34,7 +34,7 @@ import (
 )
 
 func main() {
-	mode := flag.String("mode", "fixture", "fixture | proxy | http | official | exit | phone | dns | web-probe | stun-vector | masq-vector")
+	mode := flag.String("mode", "fixture", "fixture | proxy | http | official | exit | phone | dns | web-probe | live-probe | stun-vector | masq-vector")
 	directory := flag.String("dir", "", "private test directory")
 	listen := flag.String("listen", "127.0.0.1:18080", "test listen address")
 	target := flag.String("target", "", "test proxy/HTTP target")
@@ -61,6 +61,8 @@ func main() {
 		err = dnsFixture(ctx, *listen)
 	case "web-probe":
 		err = webProbe(ctx, *listen)
+	case "live-probe":
+		err = liveProbe(ctx, *directory)
 	case "stun-vector":
 		packet, readErr := hex.DecodeString(*target)
 		if readErr != nil {

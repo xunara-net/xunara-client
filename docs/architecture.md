@@ -88,3 +88,25 @@ DNSSEC 由 Hickory 0.26.3 的 DnssecDnsHandle 验证根信任锚、DNSKEY / DS /
 ### Tests
 
 Rust 规范与协议测试、临时 CA 的 TLS 正向 / 错域名 / 非可信 CA 测试、伪 AD 拒绝；公共 HTTPS 实测签名链、签名 NXDOMAIN 与 dnssec-failed.org 拒绝。`tests/compat` 用官方 Go checksum 对照双栈 TCP / UDP / ICMP 的地址改写。真实 Linux namespace 的官方 tsnet / TUN / 子网 / ACL / DERP 回退与 SNAT 回归通过。Android 36 x86_64 实测 DoH、DoT、DNSSEC、MagicDNS、切网、应用分流、出口与身份切换通过；不冒充跨租户共享专项或 ARM64 真机验收。
+
+## 2026-10-20：TCP 转发先拨号后接受
+
+### What changed
+
+`Forwarder` 启用固定 smoltcp 0.14.0 的 `socket-tcp-pause-synack`，普通转发在处理首个 SYN 前暂停 SYN-ACK，物理 socket 连接成功才恢复；失败走原来的 abort / RST。客户端取消握手后已回到 Listen 的流及时释放。本机 peerapi DNS 没有物理 TCP 后端，不延迟其握手。
+
+### Why
+
+现网专项发现同一手机出口的 DNS 和 IPv4 HTTPS 可用，IPv6 HTTPS 却在握手后重置。旧实现先回复 SYN-ACK，再异步建立物理连接；双栈应用误判 IPv6 已连通，停止 IPv4 竞争，最终在 TLS 读写时报错。官方 Tailscale v1.104.1 的 `wgengine/netstack.forwardTCP` 同样先拨物理后端，成功后才调用 `getClient` 接受客户端，失败发送 RST。
+
+### Compatibility impact
+
+只纠正 Android 用户态 TCP 转发的连接语义，不改 TS2021、Noise、WireGuard、DERP、DNSConfig、批准路由或服务端。保持真实双栈支持，不全局禁用 IPv6，不篡改 DNS AAAA 答案；由支持 Happy Eyeballs 的应用选择可用地址。
+
+### Security impact
+
+所有外层 socket 继续先 protect，流仍绑定认证 peer、五元组和既有 ACL。IPv4 回退仍经过用户指定出口，不是出口不可用时绕过 VPN。物理拨号有超时，握手取消与失败不留下可用的假连接；诊断只使用独立的临时机器身份。
+
+### Tests
+
+双栈回归在修复前明确捕获提前 SYN-ACK，修复后验证物理连接失败从未进入 Established 且流被释放；原真实双栈 TCP / 半关闭回归保持通过。`tests/compat` 增加不可达 IPv6 与可用 IPv4 的同域名 fixture，由官方 tsnet 验证手机出口拒绝失败的 IPv6 拨号，并自动回退同一出口的 IPv4；Android 专项执行情况以应用仓库验收记录为准。
