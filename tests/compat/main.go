@@ -34,7 +34,7 @@ import (
 )
 
 func main() {
-	mode := flag.String("mode", "fixture", "fixture | proxy | http | official | exit | phone | dns | stun-vector | masq-vector")
+	mode := flag.String("mode", "fixture", "fixture | proxy | http | official | exit | phone | dns | web-probe | stun-vector | masq-vector")
 	directory := flag.String("dir", "", "private test directory")
 	listen := flag.String("listen", "127.0.0.1:18080", "test listen address")
 	target := flag.String("target", "", "test proxy/HTTP target")
@@ -59,6 +59,8 @@ func main() {
 		err = officialPhoneProbe(ctx, *directory)
 	case "dns":
 		err = dnsFixture(ctx, *listen)
+	case "web-probe":
+		err = webProbe(ctx, *listen)
 	case "stun-vector":
 		packet, readErr := hex.DecodeString(*target)
 		if readErr != nil {
@@ -76,6 +78,45 @@ func main() {
 	if err != nil && ctx.Err() == nil {
 		log.Fatal(err)
 	}
+}
+
+func webProbe(ctx context.Context, dnsAddress string) error {
+	if _, err := netip.ParseAddrPort(dnsAddress); err != nil {
+		return errors.New("web probe requires a numeric VPN DNS endpoint")
+	}
+	// 探针从 Android shell UID 发包，刻意不 protect、不使用代理，也不能跳过证书校验。
+	dialer := &net.Dialer{Timeout: 8 * time.Second, Resolver: &net.Resolver{
+		PreferGo: true,
+		Dial: func(ctx context.Context, network, _ string) (net.Conn, error) {
+			return (&net.Dialer{Timeout: 5 * time.Second}).DialContext(ctx, network, dnsAddress)
+		},
+	}}
+	transport := &http.Transport{DialContext: dialer.DialContext, TLSHandshakeTimeout: 8 * time.Second}
+	defer transport.CloseIdleConnections()
+	client := &http.Client{Transport: transport, Timeout: 20 * time.Second, CheckRedirect: func(request *http.Request, previous []*http.Request) error {
+		if request.URL.Scheme != "https" || len(previous) >= 3 {
+			return errors.New("web probe rejected redirect")
+		}
+		return nil
+	}}
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, "https://example.com/", nil)
+	if err != nil {
+		return err
+	}
+	response, err := client.Do(request)
+	if err != nil {
+		return err
+	}
+	defer response.Body.Close()
+	body, err := io.ReadAll(io.LimitReader(response.Body, 1<<20))
+	if err != nil {
+		return err
+	}
+	if response.StatusCode != http.StatusOK || response.TLS == nil || len(response.TLS.VerifiedChains) == 0 || len(body) == 0 {
+		return errors.New("web probe did not receive an authenticated HTTPS page")
+	}
+	fmt.Printf("PASS verified HTTPS status=%d bytes=%d\n", response.StatusCode, len(body))
+	return nil
 }
 
 func proxy(ctx context.Context, listen, target string) error {

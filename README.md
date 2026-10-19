@@ -115,4 +115,6 @@ sh scripts/test-netns.sh
 
 双安卓公网出口专项由相邻 `xunara-android/scripts/test-android-exit-pair.sh` 编排。fixture 的 `XUNARA_TEST_ANDROID_PAIR=true` 仅用于该隔离测试：使用默认放行策略和 `114.114.114.114` / `1.1.1.1`，由两台安卓之间的真实 WireGuard / DERP 转发验证公网 IP 与 DNS，而不是返回测试域名的固定答案。此模式启动监听前检查 rootless 用户映射和仅有回环网卡的独立网络，拒绝在宿主启动无认证测试入口；生产客户端不读取该开关。
 
+该专项另需 `(cd tests/compat && CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags='-s -w' -o ../../target/compat-web-probe .)`。测试 helper 的 `web-probe` 模式由 x86_64 模拟器的 shell UID 临时执行，经过 VPN DNS 解析及出口下载真实 HTTPS 页面，并按系统 CA 校验证书链和主机名；它不是生产客户端或 Go sidecar，不进入 APK。
+
 静态双架构发布构建：`sh scripts/build-release.sh v0.1.0 /tmp/xunara-client-release`。详见 [架构与边界](docs/architecture.md) 和 [安全说明](SECURITY.md)。
