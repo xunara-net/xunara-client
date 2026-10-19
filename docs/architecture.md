@@ -109,4 +109,6 @@ Rust 规范与协议测试、临时 CA 的 TLS 正向 / 错域名 / 非可信 CA
 
 ### Tests
 
-双栈回归在修复前明确捕获提前 SYN-ACK，修复后验证物理连接失败从未进入 Established 且流被释放；原真实双栈 TCP / 半关闭回归保持通过。`tests/compat` 增加不可达 IPv6 与可用 IPv4 的同域名 fixture，由官方 tsnet 验证手机出口拒绝失败的 IPv6 拨号，并自动回退同一出口的 IPv4；Android 专项执行情况以应用仓库验收记录为准。
+双栈回归在修复前明确捕获提前 SYN-ACK，修复后验证物理连接失败从未进入 Established 且流被释放；原真实双栈 TCP / 半关闭回归保持通过。`tests/compat` 增加连接被拒绝的 IPv6 与可用 IPv4 的同域名 fixture，由官方 tsnet 验证手机出口拒绝失败的 IPv6 拨号，并自动回退同一出口的 IPv4；Android 专项执行情况以应用仓库验收记录为准。
+
+模拟器的 QEMU 物理网络本身可能对不可达外网目标先完成 TCP 握手、随后关闭，即使没有运行 VPN 也如此。因此专项不能用一个任意 IPv6 黑洞地址充当“物理 connect 必失败”的前提。测试域名的 AAAA 显式编码当前手机的 LAN IPv6，使用本机确定关闭的 18090 端口；A 指向真实宿主 HTTP 代理的同端口。测试先确认手机物理连接确实收到 Connection refused，再经官方 tsnet 发起双栈请求，避免把模拟器的上游 SYN 代理误判为客户端残留缺陷。

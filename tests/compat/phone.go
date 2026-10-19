@@ -26,7 +26,7 @@ import (
 func fixturePolicy(denyPhone bool) []byte {
 	ports := []string{"*:8088", "*:5353", "*:53"}
 	if !denyPhone {
-		ports = append(ports, "*:18088")
+		ports = append(ports, "*:18088", "*:18090")
 	}
 	rules := []map[string]any{
 		{"action": "accept", "src": []string{"*"}, "proto": "tcp", "dst": ports},
@@ -195,12 +195,19 @@ func officialPhoneProbe(ctx context.Context, directory string) error {
 		case "denied-port":
 			result["blocked"] = !tcpProbe(probe, "10.0.2.2", "18089")
 		case "family-fallback":
-			connection, err := server.Dial(probe, "tcp6", "dual-stack.public.test:18088")
+			address, err := netip.ParseAddr(request.URL.Query().Get("ipv6"))
+			if err != nil || !address.Is6() || address.Is4In6() {
+				writer.WriteHeader(http.StatusBadRequest)
+				return
+			}
+			// QEMU 对无路由外网 IPv6 也会提前完成握手；使用手机自己的关闭端口，确保物理拨号确实失败。
+			hostname := strings.ReplaceAll(address.String(), ":", "-") + ".dual-stack.public.test"
+			connection, err := server.Dial(probe, "tcp6", net.JoinHostPort(hostname, "18090"))
 			result["ipv6_rejected"] = err != nil
 			if connection != nil {
 				connection.Close()
 			}
-			result["fallback"] = tcpProbe(probe, "dual-stack.public.test", "18088")
+			result["fallback"] = tcpProbe(probe, hostname, "18090")
 		case "blocked":
 			result["blocked"] = !tcpProbe(probe, "10.0.2.2", "18088")
 		default:

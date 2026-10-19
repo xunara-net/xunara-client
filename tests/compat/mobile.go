@@ -89,9 +89,13 @@ func dnsAnswer(bytes []byte) ([]byte, error) {
 		header := dnsmessage.ResourceHeader{Name: question.Name, Type: question.Type, Class: dnsmessage.ClassINET, TTL: 5}
 		ipv4 := [4]byte{203, 0, 113, 77}
 		ipv6 := netip.MustParseAddr("2001:db8::77")
-		if question.Name.String() == "dual-stack.public.test." {
+		if strings.HasSuffix(question.Name.String(), ".dual-stack.public.test.") {
+			address, err := netip.ParseAddr(strings.ReplaceAll(strings.TrimSuffix(question.Name.String(), ".dual-stack.public.test."), "-", ":"))
+			if err != nil || !address.Is6() || address.Is4In6() {
+				return nil, errors.New("invalid dual-stack fixture address")
+			}
 			ipv4 = [4]byte{10, 0, 2, 2}
-			ipv6 = netip.MustParseAddr("fd00:dead:beef::1")
+			ipv6 = address
 		}
 		switch question.Type {
 		case dnsmessage.TypeA:
