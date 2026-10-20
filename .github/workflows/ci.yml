@@ -69,6 +69,7 @@ jobs:
           sudo apt-get install -y nftables
           sudo unshare --net --mount sh scripts/test-netns.sh --inside
           sudo env XUNARA_TEST_SNAT=true unshare --net --mount sh scripts/test-netns.sh --inside
+          sudo env XUNARA_TEST_UNREACHABLE_DERP=true unshare --net --mount sh scripts/test-netns.sh --inside
       - name: Static Linux AMD64 and ARM64
         working-directory: xunara-client
         run: |

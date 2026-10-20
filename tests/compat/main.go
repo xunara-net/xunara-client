@@ -198,6 +198,12 @@ func fixture(ctx context.Context, directory string) error {
 			DERPPort: 18081, STUNPort: -1, CertName: "sha256-raw:" + hex.EncodeToString(digest[:]),
 		}},
 	}}}
+	if os.Getenv("XUNARA_TEST_UNREACHABLE_DERP") == "true" {
+		derpMap.Regions[1] = &tailcfg.DERPRegion{
+			RegionID: 1, RegionCode: "unreachable", RegionName: "unreachable first region",
+			Nodes: []*tailcfg.DERPNode{{Name: "1a", RegionID: 1, HostName: "127.0.0.1", IPv4: "127.0.0.1", IPv6: "none", DERPPort: 18089, STUNPort: -1}},
+		}
+	}
 	policy := filepath.Join(directory, "policy.hujson")
 	nameservers := []string{"192.168.90.2:5353"}
 	if androidPair {
@@ -249,7 +255,7 @@ func fixture(ctx context.Context, directory string) error {
 	mux.HandleFunc("/_test/node", func(writer http.ResponseWriter, request *http.Request) {
 		for _, node := range server.Store().ListNodes() {
 			if node.Hostname == request.URL.Query().Get("host") {
-				json.NewEncoder(writer).Encode(map[string]string{"ipv4": node.IPv4.String(), "ipv6": node.IPv6.String(), "id": node.StableID, "user": fmt.Sprint(node.UserID)})
+				json.NewEncoder(writer).Encode(map[string]string{"ipv4": node.IPv4.String(), "ipv6": node.IPv6.String(), "id": node.StableID, "user": fmt.Sprint(node.UserID), "home_derp": fmt.Sprint(node.HomeDERP)})
 				return
 			}
 		}

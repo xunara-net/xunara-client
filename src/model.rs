@@ -123,7 +123,7 @@ impl Node {
     }
 }
 
-#[derive(Clone, Default, Deserialize)]
+#[derive(Clone, Default, Deserialize, PartialEq, Eq)]
 #[serde(default, rename_all = "PascalCase")]
 pub struct DerpNode {
     pub host_name: String,
@@ -144,6 +144,8 @@ pub struct DerpNode {
 pub struct DerpRegion {
     pub region_code: String,
     pub region_name: String,
+    pub avoid: bool,
+    pub no_measure_no_home: bool,
     pub nodes: Vec<DerpNode>,
 }
 
@@ -151,6 +153,12 @@ pub struct DerpRegion {
 #[serde(default, rename_all = "PascalCase")]
 pub struct DerpMap {
     pub regions: BTreeMap<u16, DerpRegion>,
+}
+
+#[derive(Clone, Default, PartialEq, Eq)]
+pub struct LocalState {
+    pub endpoints: Vec<String>,
+    pub home_derp: u16,
 }
 
 #[derive(Clone, Default, Deserialize)]

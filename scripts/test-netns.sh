@@ -133,6 +133,13 @@ done
 sleep 30
 [ "$(fetch "http://$router_ip:8088" 2>/dev/null || :)" = xunara-core-ok ] || { echo 'DERP fallback failed while UDP was blocked' >&2; exit 1; }
 printf 'PASS UDP blocked: encrypted TCP falls back to certificate-pinned DERP\n'
+if [ "${XUNARA_TEST_UNREACHABLE_DERP:-false}" = true ]; then
+    for name in rust-router rust-client; do
+        get_node "$name" >"$directory/$name-home.json"
+        grep -q '"home_derp":"900"' "$directory/$name-home.json" || { echo 'Client advertised an unreachable first DERP region instead of the connected relay' >&2; exit 1; }
+    done
+    printf 'PASS unreachable first DERP: both Rust nodes advertise the authenticated live relay\n'
+fi
 for process in $router $client; do
     nsenter -t "$process" -n ip rule del priority 50 ipproto udp blackhole
 done

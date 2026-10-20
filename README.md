@@ -20,7 +20,7 @@ TCP 转发只有在真实物理连接成功后才完成隧道内握手，失败�
 - 预授权密钥或浏览器登录、设备审批；机器身份与人类账号分离。
 - BoringTun WireGuard 加密、节点密钥绑定、源地址验证、防重放和握手限流。
 - 官方 Disco Ping / Pong / CallMeMaybe、UDP 直连、STUN 外网端点发现。
-- DERP v2、CA 校验 / 精确证书 pin、自动重连与 UDP 不通时回退。
+- DERP v2、CA 校验 / 精确证书 pin、已确认可用的 home 选择、自动重连与 UDP 不通时回退。
 - IPv4 / IPv6 设备地址、显式接收已批准路由、广播子网、内核子网转发。
 - 可选 nftables 子网 SNAT，只创建自己的表，不清空现有防火墙。
 - 下发 ACL / Grants 网络规则、增量规则组、端口/协议限制、出站回复状态。
@@ -94,7 +94,7 @@ Android 通过 `mobile::Host` 注入系统授权后的 TUN、套接字保护、�
 
 UDP STUN 是打洞与地址发现，**不是 UDP 业务中继**；DERP 业务回退仍通过 TLS / TCP。后续 UDP Peer Relay 必须遵循官方分配 / 授权协议，不能把裸 UDP 转发器伪装为兼容实现。
 
-首版直连探测约每 10 秒一次，路径缓存最长 25 秒；网络切换后的回退可能需要数十秒。尚不提供客户端自动密钥轮换或完整诊断面板。
+直连探测约每 10 秒一次，有 Disco 节点的双向确认窗口为 6.5 秒。中继 home 必须完成身份握手和匹配心跳，不能固定选择最小区域编号；候选轮换、测试及仍未覆盖的物理网络边界见 [出口链路审计](docs/exit-path-audit.md)。尚不提供客户端自动密钥轮换或完整诊断面板。
 
 ## 构建与验证
 
@@ -111,6 +111,7 @@ cargo build --locked --release
 (cd tests/compat && go build -o ../../target/compat-fixture .)
 cargo test --locked --test upstream -- --ignored
 sh scripts/test-netns.sh
+XUNARA_TEST_UNREACHABLE_DERP=true sh scripts/test-netns.sh
 ```
 
 测试使用独立 user / network namespace、两台 Rust 节点和独立 LAN：验证注册、加密 TCP / ICMP、拒绝端口、审批后的子网转发、与官方 Go tsnet 双向通信，以及单向 / 双向 UDP 阻断后的证书 pin DERP 回退及恢复。完整专项需要 `nftables`，只在独立路由器 namespace 静默丢弃出站 UDP，确认入站流量不能无限续期失效的回程；恢复窗口限制为 15 秒，不用等待旧 25 秒缓存自然超时掩盖问题。可用 `XUNARA_TEST_SNAT=true sh scripts/test-netns.sh` 复测无 LAN 回程路由的 SNAT 场景。不创建生产账号，不修改宿主机路由 / sysctl / DNS。需要允许 unprivileged user namespace；受限 CI 可在隔离 namespace 内用 root 执行 `--inside`。

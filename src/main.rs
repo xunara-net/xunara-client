@@ -66,7 +66,7 @@ async fn run() -> Result<()> {
         Some(path) => read_secret(&path)?,
         None => Zeroizing::new(String::new()),
     };
-    let (endpoints, receiver) = watch::channel(Vec::new());
+    let (endpoints, receiver) = watch::channel(Default::default());
     let mut engine = Engine::new(config.clone(), identity.clone(), endpoints).await?;
     let (maps, updates) = mpsc::channel(4);
     let task = tokio::spawn(control::run(config, identity, auth_key, receiver, maps));

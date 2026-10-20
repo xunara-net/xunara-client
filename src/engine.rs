@@ -26,7 +26,7 @@ use crate::{
     filter::{Filter, Packet},
     forwarding::Forwarder,
     masquerade,
-    model::{NetworkMap, Node},
+    model::{LocalState, NetworkMap, Node},
     network::{self, Routes, Tun},
     state::{Identity, Store, parse_key},
 };
@@ -197,7 +197,7 @@ pub struct Engine {
     hub: Hub,
     derp_input: mpsc::Receiver<Received>,
     derp_output: mpsc::Sender<Received>,
-    endpoints: watch::Sender<Vec<String>>,
+    endpoints: watch::Sender<LocalState>,
     stun: Vec<([u8; 12], SocketAddr, Instant)>,
     mapped: BTreeMap<SocketAddr, Instant>,
     own_node: [u8; 32],
@@ -217,7 +217,7 @@ impl Engine {
     pub async fn new(
         config: Arc<Config>,
         identity: Arc<Identity>,
-        endpoints: watch::Sender<Vec<String>>,
+        endpoints: watch::Sender<LocalState>,
     ) -> Result<Self> {
         network::forwarding_ready(&config)?;
         let socket = Arc::new(UdpSocket::bind(config.listen).await?);
@@ -227,7 +227,10 @@ impl Engine {
             crate::mobile::host()?.protect(socket.as_raw_fd())?;
         }
         let local = network::local_endpoints(socket.local_addr()?.port(), &config.interface);
-        endpoints.send_replace(local);
+        endpoints.send_replace(LocalState {
+            endpoints: local,
+            home_derp: 0,
+        });
         let tun = Tun::create(&config).await?;
         let own_node = *crypto_box::SecretKey::from(identity.node)
             .public_key()
@@ -469,23 +472,34 @@ impl Engine {
             // IP 被重新分配或 peer 密钥 / 共享别名变化后，不把旧连接的回包许可授予新机器。
             self.filter = filter;
         }
-        let mut regions = self
+        self.map = map;
+        self.last_map = Some(Instant::now());
+        self.update_relays()?;
+        Ok(())
+    }
+
+    fn update_relays(&mut self) -> Result<()> {
+        let regions = self
             .peers
             .values()
             .map(|peer| peer.node.relay_region())
             .filter(|region| *region > 0)
             .collect::<BTreeSet<_>>();
-        if let Some(region) = map.derp.regions.keys().next() {
-            regions.insert(*region);
-        }
         self.hub.update(
-            &map.derp,
+            &self.map.derp,
             &regions.into_iter().collect::<Vec<_>>(),
             self.identity.node,
             self.derp_output.clone(),
         )?;
-        self.map = map;
-        self.last_map = Some(Instant::now());
+        let home = self.hub.home_region();
+        self.endpoints.send_if_modified(|local| {
+            if local.home_derp == home {
+                return false;
+            }
+            // HomeDERP 是实际能收回包的连接，不是 DERPMap 中最小的区域编号。
+            local.home_derp = home;
+            true
+        });
         Ok(())
     }
 
@@ -971,6 +985,7 @@ impl Engine {
             self.forwarding = None;
             return Ok(());
         }
+        self.update_relays()?;
         let identities = self.peers.keys().copied().collect::<Vec<_>>();
         let mut scratch = vec![0; 65568];
         let mut initial_budget = 16;
@@ -993,6 +1008,7 @@ impl Engine {
                     let endpoints = self
                         .endpoints
                         .borrow()
+                        .endpoints
                         .iter()
                         .filter_map(|endpoint| endpoint.parse().ok())
                         .collect::<Vec<_>>();
@@ -1052,10 +1068,10 @@ impl Engine {
         endpoints.sort();
         endpoints.dedup();
         self.endpoints.send_if_modified(|old| {
-            if *old == endpoints {
+            if old.endpoints == endpoints {
                 false
             } else {
-                *old = endpoints;
+                old.endpoints = endpoints;
                 true
             }
         });
@@ -1083,6 +1099,7 @@ impl Engine {
         json!({"type":"status","version":crate::VERSION,"updated_at":time::OffsetDateTime::now_utc().unix_timestamp(),
             "online":self.fresh(),"interface":self.config.interface,"addresses":self.map.node.as_ref().map(|node| &node.addresses),
             "peers":self.peers.len(),"direct_peers":self.peers.values().filter(|peer| peer.direct_address(now).is_some()).count(),
+            "relay":{"home_region":self.hub.home_region(),"connected":self.hub.home_region()!=0},
             "bytes_received":self.received_bytes,"bytes_sent":self.sent_bytes,"advertised_routes":self.config.advertised_routes(),
             "receive_stats":self.receive_stats,
             "forwarding":{"requested":self.config.advertised_routes(),"active":self.fresh() && self.forwarding.is_some(),"approved":self.forwarding.as_ref().map(|router|&router.plan().routes),"flows":self.forwarding.as_ref().map_or(0,Forwarder::flows)},

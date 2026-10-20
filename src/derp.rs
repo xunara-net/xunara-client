@@ -1,15 +1,18 @@
-use std::{collections::BTreeMap, time::Duration};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    time::{Duration, Instant},
+};
 
 use anyhow::{Context, Result, bail, ensure};
 use crypto_box::{
     PublicKey, SalsaBox, SecretKey,
     aead::{Aead, AeadCore},
 };
-use rand_core::OsRng;
+use rand_core::{OsRng, RngCore};
 use serde_json::json;
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
-    sync::mpsc,
+    sync::{mpsc, watch},
     task::JoinHandle,
 };
 use url::Url;
@@ -29,17 +32,56 @@ struct Outbound {
     bytes: Vec<u8>,
 }
 struct Worker {
-    definition: String,
+    definition: Vec<DerpNode>,
     sender: mpsc::Sender<Outbound>,
+    health: watch::Receiver<Option<Duration>>,
+    preferred: watch::Sender<bool>,
+    started: Instant,
     task: JoinHandle<()>,
+}
+
+#[derive(Default)]
+struct Heartbeat(Option<([u8; 8], Instant)>);
+
+impl Heartbeat {
+    fn ping(&mut self) -> Result<[u8; 8]> {
+        ensure!(self.0.is_none(), "DERP 心跳未收到匹配回应");
+        let mut nonce = [0; 8];
+        OsRng.fill_bytes(&mut nonce);
+        self.0 = Some((nonce, Instant::now()));
+        Ok(nonce)
+    }
+
+    fn pong(&mut self, payload: &[u8]) -> Option<Duration> {
+        let (nonce, started) = self.0?;
+        if nonce.as_slice() != payload || started.elapsed() >= Duration::from_secs(15) {
+            return None;
+        }
+        self.0 = None;
+        Some(started.elapsed())
+    }
 }
 
 #[derive(Default)]
 pub struct Hub {
     workers: BTreeMap<u16, Worker>,
+    attempted: BTreeMap<u16, Instant>,
+    home: u16,
 }
 
 impl Hub {
+    pub fn home_region(&self) -> u16 {
+        if self
+            .workers
+            .get(&self.home)
+            .is_some_and(|worker| worker.health.borrow().is_some() && !worker.task.is_finished())
+        {
+            self.home
+        } else {
+            0
+        }
+    }
+
     pub fn update(
         &mut self,
         map: &DerpMap,
@@ -47,63 +89,121 @@ impl Hub {
         private: [u8; 32],
         incoming: mpsc::Sender<Received>,
     ) -> Result<()> {
-        ensure!(regions.len() <= 32, "需要连接的 DERP 区域超过首版上限");
+        let definitions = map
+            .regions
+            .iter()
+            .filter_map(|(region, configuration)| {
+                let nodes = configuration
+                    .nodes
+                    .iter()
+                    .filter(|node| !node.stun_only)
+                    .take(8)
+                    .cloned()
+                    .collect::<Vec<_>>();
+                (*region != 0 && !nodes.is_empty()).then_some((*region, nodes))
+            })
+            .collect::<BTreeMap<_, _>>();
+        self.attempted
+            .retain(|region, _| definitions.contains_key(region));
         self.workers.retain(|region, worker| {
-            let keep = regions.contains(region) && map.regions.contains_key(region);
+            let keep = definitions.get(region) == Some(&worker.definition);
             if !keep {
                 worker.task.abort();
+                self.attempted.remove(region);
             }
             keep
         });
-        for region in regions {
-            let Some(configuration) = map.regions.get(region) else {
-                continue;
-            };
-            let nodes = configuration
-                .nodes
-                .iter()
-                .filter(|node| !node.stun_only)
-                .take(8)
-                .cloned()
-                .collect::<Vec<_>>();
-            if nodes.is_empty() {
-                continue;
-            }
-            let definition = nodes
-                .iter()
-                .map(|node| {
-                    format!(
-                        "{}:{}:{}:{}:{}",
-                        node.host_name,
-                        node.derp_port,
-                        node.cert_name,
-                        node.ipv4,
-                        node.insecure_for_tests
-                    )
-                })
-                .collect::<Vec<_>>()
-                .join("|");
-            if self
+        let eligible = |region: &u16| {
+            map.regions.get(region).is_some_and(|configuration| {
+                !configuration.no_measure_no_home && !configuration.avoid
+            })
+        };
+        let healthy = |region: &u16| {
+            eligible(region)
+                && self
+                    .workers
+                    .get(region)
+                    .is_some_and(|worker| worker.health.borrow().is_some())
+        };
+        // 已有可用 home 保持稳定；只有经过 TLS、DERP 身份握手和匹配 Pong 的连接才能上报。
+        if !healthy(&self.home) {
+            self.home = self
                 .workers
-                .get(region)
-                .is_some_and(|worker| worker.definition == definition)
-            {
+                .iter()
+                .filter(|(region, _)| healthy(region))
+                .min_by_key(|(region, worker)| (*worker.health.borrow(), **region))
+                .map_or(0, |(region, _)| *region);
+        }
+        let mut wanted = regions
+            .iter()
+            .filter(|region| definitions.contains_key(region))
+            .copied()
+            .collect::<BTreeSet<_>>();
+        if self.home != 0 {
+            wanted.insert(self.home);
+        }
+        ensure!(wanted.len() <= 32, "需要连接的 DERP 区域超过首版上限");
+        if self.home == 0 {
+            // 无 home 时最多并行四条候选连接，轮换失败区域；不能永久困在最小编号上。
+            let mut candidates = definitions
+                .keys()
+                .filter(|region| eligible(region) && !wanted.contains(region))
+                .copied()
+                .collect::<Vec<_>>();
+            candidates.sort_by_key(|region| {
+                let probing = self
+                    .workers
+                    .get(region)
+                    .is_some_and(|worker| worker.started.elapsed() < Duration::from_secs(15));
+                (!probing, self.attempted.get(region).copied(), *region)
+            });
+            wanted.extend(candidates.into_iter().take(4.min(32 - wanted.len())));
+        }
+        self.workers.retain(|region, worker| {
+            if wanted.contains(region) {
+                return true;
+            }
+            worker.task.abort();
+            false
+        });
+        for region in wanted {
+            if let Some(worker) = self.workers.get(&region) {
+                worker.preferred.send_if_modified(|preferred| {
+                    let updated = region == self.home;
+                    let changed = *preferred != updated;
+                    *preferred = updated;
+                    changed
+                });
                 continue;
             }
-            if let Some(worker) = self.workers.remove(region) {
-                worker.task.abort();
-            }
+            let nodes = definitions[&region].clone();
+            let definition = nodes.clone();
             let (sender, receiver) = mpsc::channel(128);
+            let (health_sender, health) = watch::channel(None);
+            let (preferred, preference) = watch::channel(region == self.home);
             let incoming = incoming.clone();
-            let region_id = *region;
             let task = tokio::spawn(async move {
-                reconnect(region_id, nodes, private, receiver, incoming).await;
+                reconnect(
+                    region,
+                    nodes,
+                    private,
+                    receiver,
+                    incoming,
+                    health_sender,
+                    preference,
+                )
+                .await;
             });
+            let started = Instant::now();
+            self.attempted.insert(region, started);
             self.workers.insert(
-                *region,
+                region,
                 Worker {
                     definition,
                     sender,
+                    health,
+                    preferred,
+                    started,
                     task,
                 },
             );
@@ -137,11 +237,23 @@ async fn reconnect(
     private: [u8; 32],
     mut outgoing: mpsc::Receiver<Outbound>,
     incoming: mpsc::Sender<Received>,
+    health: watch::Sender<Option<Duration>>,
+    mut preferred: watch::Receiver<bool>,
 ) {
     let mut attempt = 0;
     loop {
         let node = &nodes[attempt % nodes.len()];
-        let result = session(region, node, private, &mut outgoing, &incoming).await;
+        let result = session(
+            region,
+            node,
+            private,
+            &mut outgoing,
+            &incoming,
+            &health,
+            &mut preferred,
+        )
+        .await;
+        health.send_replace(None);
         if result.is_ok() || outgoing.is_closed() {
             return;
         }
@@ -157,6 +269,8 @@ async fn session(
     private: [u8; 32],
     outgoing: &mut mpsc::Receiver<Outbound>,
     incoming: &mpsc::Sender<Received>,
+    health: &watch::Sender<Option<Duration>>,
+    preferred: &mut watch::Receiver<bool>,
 ) -> Result<()> {
     let port = if node.derp_port == 0 {
         443
@@ -207,9 +321,10 @@ async fn session(
         .decrypt(information[..24].into(), &information[24..])
         .map_err(|_| anyhow::anyhow!("DERP 服务端身份校验失败"))?;
     let _: serde_json::Value = serde_json::from_slice(&clear)?;
-    write_frame(&mut stream, 7, &[1]).await?;
+    let preference = *preferred.borrow_and_update();
+    write_frame(&mut stream, 7, &[u8::from(preference)]).await?;
     let (mut reader, mut writer) = tokio::io::split(stream);
-    let (pongs, mut received_pings) = mpsc::channel::<Vec<u8>>(8);
+    let (control, mut received_control) = mpsc::channel::<(u8, Vec<u8>)>(8);
     let incoming = incoming.clone();
     let mut reading = AbortOnDrop(tokio::spawn(async move {
         loop {
@@ -229,8 +344,8 @@ async fn session(
                         return Ok::<(), anyhow::Error>(());
                     }
                 }
-                0x12 if payload.len() == 8 => {
-                    if pongs.try_send(payload).is_err() {
+                0x12 | 0x13 if payload.len() == 8 => {
+                    if control.try_send((kind, payload)).is_err() {
                         bail!("DERP 心跳积压");
                     }
                 }
@@ -239,17 +354,33 @@ async fn session(
             }
         }
     }));
-    let mut ticker = tokio::time::interval(Duration::from_secs(30));
+    let mut ticker = tokio::time::interval(Duration::from_secs(15));
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut heartbeat = Heartbeat::default();
     loop {
         tokio::select! {
             result = &mut reading.0 => return result?,
-            Some(payload) = received_pings.recv() => write_frame(&mut writer,0x13,&payload).await?,
+            Some((kind, payload)) = received_control.recv() => {
+                if kind == 0x12 {
+                    write_frame(&mut writer,0x13,&payload).await?;
+                } else if let Some(rtt) = heartbeat.pong(&payload) {
+                    health.send_replace(Some(rtt));
+                }
+            }
+            changed = preferred.changed() => {
+                changed?;
+                let preference = *preferred.borrow_and_update();
+                write_frame(&mut writer,7,&[u8::from(preference)]).await?;
+            }
             packet = outgoing.recv() => {
                 let Some(packet) = packet else { return Ok(()); };
                 let mut payload = packet.peer.to_vec(); payload.extend_from_slice(&packet.bytes);
                 write_frame(&mut writer,4,&payload).await?;
             }
-            _ = ticker.tick() => write_frame(&mut writer,0x12,&[0;8]).await?,
+            _ = ticker.tick() => {
+                let nonce = heartbeat.ping()?;
+                write_frame(&mut writer,0x12,&nonce).await?;
+            }
         }
     }
 }
@@ -289,3 +420,6 @@ async fn write_frame(
     .await
     .context("DERP 写超时")?
 }
+
+#[cfg(test)]
+mod tests;

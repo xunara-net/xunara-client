@@ -15,7 +15,7 @@ use zeroize::Zeroizing;
 use crate::{
     VERSION,
     config::Config,
-    model::NetworkMap,
+    model::{LocalState, NetworkMap},
     state::{Identity, public_key},
     transport,
 };
@@ -226,7 +226,7 @@ pub async fn run(
     config: Arc<Config>,
     identity: Arc<Identity>,
     auth_key: Zeroizing<String>,
-    endpoints: watch::Receiver<Vec<String>>,
+    endpoints: watch::Receiver<LocalState>,
     maps: mpsc::Sender<NetworkMap>,
 ) -> Result<()> {
     let url = crate::config::server_url(&config.server)?;
@@ -268,7 +268,7 @@ async fn session(
     identity: &Identity,
     url: &Url,
     auth_key: &str,
-    mut endpoints: watch::Receiver<Vec<String>>,
+    mut endpoints: watch::Receiver<LocalState>,
     maps: &mpsc::Sender<NetworkMap>,
 ) -> Result<()> {
     let client = Client::connect(url, identity).await?;
@@ -280,9 +280,10 @@ async fn session(
     }
     let mut map = NetworkMap::default();
     let initial = endpoints.borrow().clone();
-    let mut incoming = client.open_map(config, identity, &initial, 0).await?;
+    let mut incoming = client
+        .open_map(config, identity, &initial.endpoints, initial.home_derp)
+        .await?;
     let mut bytes = BytesMut::new();
-    let mut home = 0;
     let mut expiry = tokio::time::interval(Duration::from_secs(30));
     loop {
         tokio::select! {
@@ -302,25 +303,18 @@ async fn session(
                         let _ = maps.send(map.clone()).await;
                         bail!("设备已失效、撤销或未授权");
                     }
-                    let preferred=if map.derp.regions.contains_key(&home) {home} else {map.derp.regions.keys().next().copied().unwrap_or(0)};
-                    if home!=preferred {
-                        home=preferred;
-                        // 首张 DERPMap 后立即上报 home，不能让对端等 30 秒或只沿握手回程通信。
-                        let advertised=endpoints.borrow().clone();
-                        client.update_endpoints(config,identity,&advertised,home).await?;
-                    }
                     if maps.send(map.clone()).await.is_err() { return Ok(()); }
                 }
             }
             changed = endpoints.changed() => {
                 changed?;
                 let advertised = endpoints.borrow().clone();
-                client.update_endpoints(config, identity, &advertised, home).await?;
+                client.update_endpoints(config, identity, &advertised.endpoints, advertised.home_derp).await?;
             }
             _ = expiry.tick() => {
                 ensure!(map.node.as_ref().is_none_or(|node| node.valid()), "设备密钥已过期");
                 let advertised = endpoints.borrow().clone();
-                client.update_endpoints(config, identity, &advertised, home).await?;
+                client.update_endpoints(config, identity, &advertised.endpoints, advertised.home_derp).await?;
             }
         }
     }
