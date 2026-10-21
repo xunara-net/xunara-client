@@ -175,6 +175,30 @@ pub struct DnsConfig {
     pub extra_records: Vec<DnsRecord>,
 }
 
+impl DnsConfig {
+    pub fn resolver_addresses(&self) -> Vec<&str> {
+        self.resolvers
+            .iter()
+            .map(|resolver| resolver.addr.as_str())
+            .collect()
+    }
+
+    pub fn route_addresses(&self) -> BTreeMap<&str, Vec<&str>> {
+        self.routes
+            .iter()
+            .map(|(domain, resolvers)| {
+                (
+                    domain.as_str(),
+                    resolvers
+                        .iter()
+                        .map(|resolver| resolver.addr.as_str())
+                        .collect(),
+                )
+            })
+            .collect()
+    }
+}
+
 fn dns_routes<'de, Deserializer: serde::Deserializer<'de>>(
     deserializer: Deserializer,
 ) -> std::result::Result<BTreeMap<String, Vec<DnsResolver>>, Deserializer::Error> {
@@ -509,6 +533,24 @@ mod tests {
             map.apply(json!({"DNSConfig":{"Domains":["x".repeat(254)]}}))
                 .is_err()
         );
+    }
+
+    #[test]
+    fn dns_configuration_lists_real_resolvers_and_preserves_split_routes() {
+        let mut map = NetworkMap::default();
+        map.apply(json!({"DNSConfig":{"Resolvers":[{"Addr":"1.1.1.1"},{"Addr":"114.114.114.114"}],"Routes":{"office.example":[{"Addr":"10.0.0.53"}],"local.example":null}}})).unwrap();
+        assert_eq!(
+            map.dns.resolver_addresses(),
+            vec!["1.1.1.1", "114.114.114.114"]
+        );
+        let routes = map.dns.route_addresses();
+        assert_eq!(routes["office.example"], vec!["10.0.0.53"]);
+        assert!(routes["local.example"].is_empty());
+        map.apply(json!({"DNSConfig":null})).unwrap();
+        assert_eq!(map.dns.resolver_addresses().len(), 2);
+        map.apply(json!({"DNSConfig":{}})).unwrap();
+        assert!(map.dns.resolver_addresses().is_empty());
+        assert!(map.dns.route_addresses().is_empty());
     }
 }
 #[test]
