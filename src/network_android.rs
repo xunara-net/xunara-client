@@ -111,7 +111,12 @@ pub struct Routes {
 impl Routes {
     pub async fn apply(&mut self, config: &Config, map: &NetworkMap) -> Result<()> {
         let host = mobile::host()?;
-        let configuration = VpnConfiguration::from_map(config, map, &host.local_networks()?)?;
+        let configuration = VpnConfiguration::from_map_with_dns(
+            config,
+            map,
+            &host.local_networks()?,
+            &host.dns_servers()?,
+        )?;
         if self.configuration.as_ref() != Some(&configuration) {
             self.pending = Some(host.configure(&configuration)?);
             self.configuration = Some(configuration);

@@ -43,6 +43,7 @@ pub struct DnsPlan {
     records: BTreeMap<Name, Vec<RData>>,
     routes: BTreeMap<Name, Vec<Target>>,
     defaults: Vec<Target>,
+    peer_defaults: Option<Vec<Target>>,
     tunnel_routes: Vec<IpNet>,
     exit: bool,
     pub dnssec_validate: bool,
@@ -151,6 +152,7 @@ impl DnsPlan {
             records: BTreeMap::new(),
             routes: BTreeMap::new(),
             defaults: Vec::new(),
+            peer_defaults: None,
             tunnel_routes: Vec::new(),
             exit: !config.exit_node_id.is_empty(),
             dnssec_validate: config.dnssec_validate,
@@ -249,6 +251,11 @@ impl DnsPlan {
             if plan.defaults.is_empty() {
                 plan.defaults = fallback.iter().copied().map(Target::Dns).collect();
             }
+            // 官方 Android 出口的 peerapi 使用宿主解析器，不把平台公共 DNS 当作手机系统 DNS。
+            // 显式指定的加密解析器或 DNSSEC 仍走用户配置，不能因出口查询绕过这些安全设置。
+            if config.dns_resolvers.is_empty() && !config.dnssec_validate && !fallback.is_empty() {
+                plan.peer_defaults = Some(fallback.iter().copied().map(Target::Dns).collect());
+            }
         }
         Ok(Some(plan))
     }
@@ -303,6 +310,14 @@ impl DnsPlan {
             }
         }
         Answer::Forward(self.defaults.clone())
+    }
+
+    pub fn answer_for_peer(&self, query: &Message) -> Answer {
+        match (self.answer(query), &self.peer_defaults) {
+            // MagicDNS 和权威 NXDOMAIN 仍在本地回答，不能向运营商泄露网络内设备名。
+            (Answer::Forward(_), Some(targets)) => Answer::Forward(targets.clone()),
+            (answer, _) => answer,
+        }
     }
 }
 
@@ -618,5 +633,68 @@ mod tests {
         }];
         let plan = DnsPlan::new(&config, &map, &[], &[]).unwrap().unwrap();
         assert_eq!(plan.address, "100.100.100.101".parse::<IpAddr>().unwrap());
+    }
+
+    #[test]
+    fn peer_dns_preserves_local_names_explicit_security_and_selected_exit() {
+        let fallback = ["192.0.2.53:53".parse().unwrap()];
+        let config = Config {
+            accept_dns: true,
+            ..Config::default()
+        };
+        let plan = DnsPlan::new(&config, &map(), &[], &fallback)
+            .unwrap()
+            .unwrap();
+        let question = ask("example.com", RecordType::A);
+        let Answer::Forward(normal) = plan.answer(&question) else {
+            panic!("network DNS");
+        };
+        let Answer::Forward(peer) = plan.answer_for_peer(&question) else {
+            panic!("physical DNS");
+        };
+        assert_eq!(normal[0].address(), "9.9.9.9:53".parse().unwrap());
+        assert_eq!(peer[0].address(), fallback[0]);
+        for name in [
+            "nas.mesh.test",
+            "missing.mesh.test",
+            "2.0.80.100.in-addr.arpa",
+        ] {
+            assert!(matches!(
+                plan.answer_for_peer(&ask(name, RecordType::A)),
+                Answer::Local(_)
+            ));
+        }
+        for secured in [
+            Config {
+                dnssec_validate: true,
+                ..config.clone()
+            },
+            Config {
+                dns_resolvers: vec![DnsResolver {
+                    addr: "https://192.0.2.54/dns-query".into(),
+                    ..DnsResolver::default()
+                }],
+                ..config.clone()
+            },
+            Config {
+                exit_node_id: "missing-exit".into(),
+                ..config.clone()
+            },
+        ] {
+            let plan = DnsPlan::new(&secured, &map(), &[], &fallback)
+                .unwrap()
+                .unwrap();
+            let Answer::Forward(normal) = plan.answer(&question) else {
+                panic!("network DNS");
+            };
+            let Answer::Forward(peer) = plan.answer_for_peer(&question) else {
+                panic!("peer DNS");
+            };
+            assert_eq!(normal, peer);
+            assert!(!peer.iter().any(|target| target.address() == fallback[0]));
+            if !secured.exit_node_id.is_empty() {
+                assert!(peer.is_empty());
+            }
+        }
     }
 }

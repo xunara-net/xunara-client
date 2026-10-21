@@ -207,11 +207,10 @@ func fixture(ctx context.Context, directory string) error {
 		}
 	}
 	policy := filepath.Join(directory, "policy.hujson")
-	nameservers := []string{"192.168.90.2:5353"}
+	nameservers := fixtureNameservers(androidPair)
 	if androidPair {
 		// 保持与待诊断租户相同的默认放行和公网 DNS，不能用假域名响应代替公网验收。
 		policy = ""
-		nameservers = []string{"114.114.114.114", "1.1.1.1"}
 	} else if err := os.WriteFile(policy, fixturePolicy(false), 0o600); err != nil {
 		return err
 	}
@@ -336,6 +335,17 @@ func fixture(ctx context.Context, directory string) error {
 	httpServer := &http.Server{Addr: "0.0.0.0:8080", Handler: mux, ReadHeaderTimeout: 5 * time.Second}
 	go func() { <-ctx.Done(); httpServer.Close() }()
 	return httpServer.ListenAndServe()
+}
+
+func fixtureNameservers(androidPair bool) []string {
+	if !androidPair {
+		return []string{"192.168.90.2:5353"}
+	}
+	// 仅用于已验证隔离的双安卓夹具，复现平台 DNS 不可达而手机物理 DNS 可用的情形。
+	if os.Getenv("XUNARA_TEST_UNREACHABLE_DNS") == "true" {
+		return []string{"192.0.2.53"}
+	}
+	return []string{"114.114.114.114", "1.1.1.1"}
 }
 
 func official(ctx context.Context, directory, target string) error {

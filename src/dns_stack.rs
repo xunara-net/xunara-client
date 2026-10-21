@@ -36,6 +36,9 @@ pub struct Statistics {
     servfail: u64,
     nxdomain: u64,
     timeouts: u64,
+    peer_queries: u64,
+    peer_responses: u64,
+    peer_servfail: u64,
 }
 
 enum Client {
@@ -438,8 +441,15 @@ impl DnsProxy {
     fn request(&mut self, client: Client, query: Message) {
         if matches!(&client, Client::Udp(..) | Client::Tcp(..)) {
             self.statistics.queries += 1;
+        } else if matches!(&client, Client::Api(_)) {
+            self.statistics.peer_queries += 1;
         }
-        match self.plan.answer(&query) {
+        let answer = if matches!(&client, Client::Api(_)) {
+            self.plan.answer_for_peer(&query)
+        } else {
+            self.plan.answer(&query)
+        };
+        match answer {
             Answer::Local(response) => self.respond(client, &response),
             Answer::Forward(targets) => {
                 let internal = matches!(&client, Client::Validation(_));
@@ -484,10 +494,18 @@ impl DnsProxy {
             return;
         };
         if !self.plan.tunneled(&target) {
+            let mut targets = vec![target];
+            while pending
+                .targets
+                .front()
+                .is_some_and(|target| !self.plan.tunneled(target))
+            {
+                targets.push(pending.targets.pop_front().expect("checked resolver"));
+            }
             pending.direct = true;
             let query = pending.query.clone();
             self.tasks
-                .spawn(async move { (id, direct(&target, &query).await) });
+                .spawn(async move { (id, direct_resolvers(targets, query).await) });
             return;
         }
         let Some(source) = self
@@ -567,6 +585,11 @@ impl DnsProxy {
                 ResponseCode::ServFail => self.statistics.servfail += 1,
                 ResponseCode::NXDomain => self.statistics.nxdomain += 1,
                 _ => {}
+            }
+        } else if matches!(&client, Client::Api(_)) {
+            self.statistics.peer_responses += 1;
+            if response.metadata.response_code == ResponseCode::ServFail {
+                self.statistics.peer_servfail += 1;
             }
         }
         match client {
@@ -703,6 +726,39 @@ fn upstream_response(target: &Target, bytes: &[u8], closed: bool) -> Result<Opti
             Ok(None)
         }
     }
+}
+
+async fn direct_resolvers(targets: Vec<Target>, query: Message) -> Result<Message> {
+    let mut tasks = JoinSet::new();
+    for (index, target) in targets.into_iter().take(3).enumerate() {
+        let query = query.clone();
+        tasks.spawn(async move {
+            // 有界错峰并发与官方多解析器竞争一致，避免首个 DNS 黑洞拖死全部手机解析。
+            tokio::time::sleep(Duration::from_millis(index as u64 * 150)).await;
+            direct(&target, &query).await
+        });
+    }
+    let mut soft_error = None;
+    let mut failure = None;
+    while let Some(result) = tasks.join_next().await {
+        match result {
+            Ok(Ok(response))
+                if matches!(
+                    response.metadata.response_code,
+                    ResponseCode::ServFail | ResponseCode::Refused
+                ) =>
+            {
+                soft_error = Some(response);
+            }
+            Ok(Ok(response)) => return Ok(response),
+            Ok(Err(error)) => failure = Some(error),
+            Err(error) => failure = Some(error.into()),
+        }
+    }
+    if let Some(response) = soft_error {
+        return Ok(response);
+    }
+    Err(failure.unwrap_or_else(|| anyhow::anyhow!("DNS 没有可用解析器")))
 }
 
 async fn direct(target: &Target, query: &Message) -> Result<Message> {
@@ -919,6 +975,154 @@ mod tests {
         }
     }
 
+    async fn answering_resolver(socket: tokio::net::UdpSocket) {
+        let mut bytes = [0; 4096];
+        let (length, source) = socket.recv_from(&mut bytes).await.unwrap();
+        let query = dns::query(&bytes[..length]).unwrap();
+        let mut response = dns::reply(&query, ResponseCode::NoError);
+        response.answers.push(hickory_proto::rr::Record::from_rdata(
+            query.queries[0].name().clone(),
+            60,
+            hickory_proto::rr::RData::from("203.0.113.77".parse::<IpAddr>().unwrap()),
+        ));
+        socket
+            .send_to(&response.to_vec().unwrap(), source)
+            .await
+            .unwrap();
+    }
+
+    async fn await_answer(
+        server: &mut DnsProxy,
+        mut response: oneshot::Receiver<Message>,
+    ) -> Message {
+        tokio::time::timeout(Duration::from_millis(900), async {
+            loop {
+                assert!(server.poll().is_empty());
+                if let Ok(response) = response.try_recv() {
+                    return response;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("健康的备用 DNS 不应等待首个解析器超时")
+    }
+
+    #[tokio::test]
+    async fn healthy_dns_does_not_wait_for_an_unreachable_first_resolver() {
+        let (blackhole, _tcp_blackhole) = dns_listeners().await;
+        let (healthy, _tcp_healthy) = dns_listeners().await;
+        let mut map = NetworkMap::default();
+        map.apply(json!({"Node":{"ID":1,"Key":"own","MachineAuthorized":true,"Addresses":["100.80.0.1/32"]},
+            "DNSConfig":{"Resolvers":[{"Addr":blackhole.local_addr().unwrap().to_string()},{"Addr":healthy.local_addr().unwrap().to_string()}]}})).unwrap();
+        let config = ClientConfig {
+            accept_dns: true,
+            ..ClientConfig::default()
+        };
+        let mut server =
+            DnsProxy::new(DnsPlan::new(&config, &map, &[], &[]).unwrap().unwrap()).unwrap();
+        let worker = tokio::spawn(answering_resolver(healthy));
+        let mut query = Message::query();
+        query.queries.push(Query::query(
+            Name::from_ascii("external.public.test.").unwrap(),
+            RecordType::A,
+        ));
+        let (reply, response) = oneshot::channel();
+        server.request(Client::Validation(reply), query);
+        assert_eq!(await_answer(&mut server, response).await.answers.len(), 1);
+        worker.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn exit_peer_dns_uses_the_providers_physical_resolver() {
+        let (blackhole, _tcp_blackhole) = dns_listeners().await;
+        let (healthy, _tcp_healthy) = dns_listeners().await;
+        let physical = healthy.local_addr().unwrap();
+        let mut map = NetworkMap::default();
+        map.apply(json!({"Node":{"ID":1,"Key":"own","MachineAuthorized":true,"Addresses":["100.80.0.1/32"]},
+            "DNSConfig":{"Resolvers":[{"Addr":blackhole.local_addr().unwrap().to_string()}]}})).unwrap();
+        let config = ClientConfig {
+            accept_dns: true,
+            advertise_exit: true,
+            ..ClientConfig::default()
+        };
+        let mut server = DnsProxy::new(
+            DnsPlan::new(&config, &map, &[], &[physical])
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap();
+        let worker = tokio::spawn(answering_resolver(healthy));
+        let mut query = Message::query();
+        query.queries.push(Query::query(
+            Name::from_ascii("external.public.test.").unwrap(),
+            RecordType::A,
+        ));
+        let (reply, response) = oneshot::channel();
+        server
+            .api_sender()
+            .try_send(ApiRequest { query, reply })
+            .unwrap();
+        assert_eq!(await_answer(&mut server, response).await.answers.len(), 1);
+        worker.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn resolver_race_ignores_soft_errors_but_preserves_nxdomain_and_cancels_losers() {
+        for code in [
+            ResponseCode::ServFail,
+            ResponseCode::Refused,
+            ResponseCode::NXDomain,
+        ] {
+            let (first, _tcp_first) = dns_listeners().await;
+            let (second, _tcp_second) = dns_listeners().await;
+            let targets = vec![
+                Target::Dns(first.local_addr().unwrap()),
+                Target::Dns(second.local_addr().unwrap()),
+            ];
+            let worker = tokio::spawn(async move {
+                let mut bytes = [0; 4096];
+                let (length, source) = first.recv_from(&mut bytes).await.unwrap();
+                let query = dns::query(&bytes[..length]).unwrap();
+                first
+                    .send_to(&dns::reply(&query, code).to_vec().unwrap(), source)
+                    .await
+                    .unwrap();
+            });
+            let mut query = Message::query();
+            query.metadata.id = 1234;
+            query.queries.push(Query::query(
+                Name::from_ascii("external.public.test.").unwrap(),
+                RecordType::A,
+            ));
+            if code == ResponseCode::NXDomain {
+                let response = direct_resolvers(targets, query).await.unwrap();
+                assert_eq!(response.metadata.response_code, code);
+                assert_eq!(response.metadata.id, 1234);
+                let mut bytes = [0; 4096];
+                assert!(
+                    tokio::time::timeout(Duration::from_millis(300), second.recv_from(&mut bytes))
+                        .await
+                        .is_err()
+                );
+            } else {
+                let healthy = tokio::spawn(answering_resolver(second));
+                let response = tokio::time::timeout(
+                    Duration::from_millis(900),
+                    direct_resolvers(targets, query),
+                )
+                .await
+                .unwrap()
+                .unwrap();
+                assert_eq!(response.metadata.response_code, ResponseCode::NoError);
+                assert_eq!(response.metadata.id, 1234);
+                assert_eq!(response.answers.len(), 1);
+                healthy.await.unwrap();
+            }
+            worker.await.unwrap();
+        }
+    }
+
     fn proxy() -> DnsProxy {
         let mut map = NetworkMap::default();
         map.apply(json!({"Node":{"ID":1,"Name":"phone.mesh.test.","Key":"key","MachineAuthorized":true,"Addresses":["100.80.0.1/32","fd7a:115c:a1e0::1/128"]},
@@ -1071,7 +1275,7 @@ mod tests {
         let statistics = serde_json::to_value(server.statistics()).unwrap();
         assert_eq!(
             statistics,
-            json!({"queries":3,"responses":3,"servfail":1,"nxdomain":1,"timeouts":1})
+            json!({"queries":3,"responses":3,"servfail":1,"nxdomain":1,"timeouts":1,"peer_queries":1,"peer_responses":1,"peer_servfail":0})
         );
     }
 

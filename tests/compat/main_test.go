@@ -8,6 +8,24 @@ import (
 	"testing"
 )
 
+func TestUnreachableDNSIsLimitedToTheIsolatedAndroidPair(test *testing.T) {
+	for _, enabled := range []string{"", "false", "true"} {
+		test.Run(enabled, func(test *testing.T) {
+			test.Setenv("XUNARA_TEST_UNREACHABLE_DNS", enabled)
+			if got := strings.Join(fixtureNameservers(false), ","); got != "192.168.90.2:5353" {
+				test.Fatalf("ordinary fixture DNS changed: %s", got)
+			}
+			want := "114.114.114.114,1.1.1.1"
+			if enabled == "true" {
+				want = "192.0.2.53"
+			}
+			if got := strings.Join(fixtureNameservers(true), ","); got != want {
+				test.Fatalf("pair fixture DNS = %s, want %s", got, want)
+			}
+		})
+	}
+}
+
 func TestWebProbeRejectsInvalidPreResolvedTarget(test *testing.T) {
 	for _, address := range []string{"127.0.0.1", "10.0.0.1", "0.0.0.0", "224.0.0.1", "::1", "2606:4700::1111", "::ffff:1.1.1.1", "example.com"} {
 		test.Run(address, func(test *testing.T) {

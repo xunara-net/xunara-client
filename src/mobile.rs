@@ -64,6 +64,15 @@ pub struct VpnConfiguration {
 
 impl VpnConfiguration {
     pub fn from_map(config: &Config, map: &NetworkMap, local: &[IpNet]) -> Result<Self> {
+        Self::from_map_with_dns(config, map, local, &[])
+    }
+
+    pub fn from_map_with_dns(
+        config: &Config,
+        map: &NetworkMap,
+        local: &[IpNet],
+        fallback: &[std::net::SocketAddr],
+    ) -> Result<Self> {
         let node = map.node.as_ref().context("缺少本机映射")?;
         ensure!(node.valid(), "设备未授权或已过期");
         ensure!(!config.snat, "Android 使用用户态转发，不修改内核 NAT");
@@ -134,7 +143,8 @@ impl VpnConfiguration {
             }
         }
         routes.extend(addresses.iter().copied());
-        let dns = crate::dns::DnsPlan::new(config, map, local, &[])?;
+        // 操作系统与内核必须使用相同的退避输入，否则系统向旧地址发包而代理监听新地址。
+        let dns = crate::dns::DnsPlan::new(config, map, local, fallback)?;
         if let Some(address) = dns.as_ref().map(|dns| dns.address) {
             routes.insert(address.into());
         }
@@ -280,6 +290,32 @@ mod tests {
                 .routes
                 .iter()
                 .any(|route| route.contains(&"1.1.1.1".parse::<std::net::IpAddr>().unwrap()))
+        );
+    }
+
+    #[test]
+    fn os_dns_and_proxy_share_the_same_collision_retreat() {
+        let config = Config {
+            accept_dns: true,
+            ..Config::default()
+        };
+        let map = map();
+        let fallback = ["100.100.100.100:53".parse().unwrap()];
+        let proxy = crate::dns::DnsPlan::new(&config, &map, &[], &fallback)
+            .unwrap()
+            .unwrap();
+        let configuration =
+            VpnConfiguration::from_map_with_dns(&config, &map, &[], &fallback).unwrap();
+        assert_eq!(
+            proxy.address,
+            "100.100.100.101".parse::<std::net::IpAddr>().unwrap()
+        );
+        assert_eq!(configuration.dns_servers, vec![proxy.address]);
+        assert!(configuration.routes.contains(&proxy.address.into()));
+        assert!(
+            !configuration
+                .routes
+                .contains(&"100.100.100.100/32".parse().unwrap())
         );
     }
 }
