@@ -94,6 +94,35 @@ if fetch "http://$router_ip:8089" >/dev/null 2>&1; then echo 'ACL unexpectedly a
 printf 'PASS denied ACL port\n'
 nsenter -t "$client" -n ping -c 2 -W 2 "$router_ip" >"$directory/ping.log"
 printf 'PASS encrypted ICMP\n'
+deadline=$(($(date +%s) + 25))
+until grep -Eq '"direct_peers": [1-9][0-9]*' "$directory/client/status.json"; do
+    [ "$(date +%s)" -lt "$deadline" ] || {
+        cp "$directory/client/status.json" "$directory/direct-failure.json"
+        echo 'UDP discovery did not produce a freshly confirmed path' >&2
+        exit 1
+    }
+    [ "$(fetch "http://$router_ip:8088" 2>/dev/null || :)" = xunara-core-ok ] || exit 1
+    sleep 0.5
+done
+deadline=$(($(date +%s) + 22))
+last_status=$(date +%s)
+confirmed=0
+while [ "$(date +%s)" -lt "$deadline" ]; do
+    [ "$(fetch "http://$router_ip:8088" 2>/dev/null || :)" = xunara-core-ok ] || exit 1
+    updated=$(sed -n 's/.*"updated_at": \([0-9]*\).*/\1/p' "$directory/client/status.json")
+    if [ -n "$updated" ] && [ "$updated" -gt "$last_status" ]; then
+        grep -Eq '"direct_peers": [1-9][0-9]*' "$directory/client/status.json" || {
+            cp "$directory/client/status.json" "$directory/direct-failure.json"
+            echo 'Healthy UDP path expired during active TCP traffic; direct heartbeats must precede trust expiry' >&2
+            exit 1
+        }
+        last_status=$updated
+        confirmed=$((confirmed + 1))
+    fi
+    sleep 0.5
+done
+[ "$confirmed" -ge 2 ] || { echo 'Missing fresh direct-path status samples' >&2; exit 1; }
+printf 'PASS active TCP retains a freshly confirmed UDP path across periodic status updates\n'
 curl --noproxy '*' -fsS -X POST http://127.0.0.1:18080/_test/approve >"$directory/approve.json"
 attempt=0
 until [ "$(fetch http://192.168.90.2:8088 2>/dev/null || :)" = xunara-core-ok ]; do

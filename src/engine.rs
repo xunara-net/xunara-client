@@ -80,6 +80,18 @@ impl Peer {
             .map(|(address, _)| address)
     }
 
+    fn heartbeat_target(&self, now: Instant) -> Option<SocketAddr> {
+        self.disco?;
+        let target = self.direct_address(now)?;
+        let (_, confirmed) = self.direct?;
+        let interval = Duration::from_secs(3);
+        (now.saturating_duration_since(confirmed) >= interval
+            && !self.probes.iter().any(|(_, address, sent)| {
+                *address == target && now.saturating_duration_since(*sent) < interval
+            }))
+        .then_some(target)
+    }
+
     fn authenticated_udp(&mut self, source: SocketAddr, now: Instant) {
         // 收到 WireGuard 只证明入站可达；Disco 节点必须用往返探测确认回程。
         // 无 Disco 的纯 WireGuard 对端才短暂沿用已认证的源地址。
@@ -219,6 +231,10 @@ struct ReceiveStats {
     acl_drops: u64,
     related_icmp: u64,
     untracked_exit_drops: u64,
+    disco_packets: u64,
+    disco_pings: u64,
+    disco_pongs: u64,
+    disco_confirmed: u64,
 }
 
 pub struct Engine {
@@ -745,6 +761,7 @@ impl Engine {
             return Ok(());
         }
         if bytes.starts_with(discovery::MAGIC) {
+            self.receive_stats.disco_packets += 1;
             if self.budget == 0 {
                 return Ok(());
             }
@@ -990,17 +1007,21 @@ impl Engine {
                 {
                     return;
                 }
+                self.receive_stats.disco_pings += 1;
                 let discovered = peer.observe_endpoint(source, Instant::now());
                 let pong = discovery::pong(&message[2..14], source);
                 if let Some(bytes) = discovery::seal(&self.identity.disco, &disco, &pong) {
                     let _ = self.socket.send_to(&bytes, source).await;
                 }
                 if discovered {
-                    self.probe(identity).await;
+                    self.probe(identity, None).await;
                 }
             }
             (2, Path::Udp(source)) if message.len() >= 32 => {
-                peer.confirm_pong(source, &message[2..14], Instant::now());
+                self.receive_stats.disco_pongs += 1;
+                if peer.confirm_pong(source, &message[2..14], Instant::now()) {
+                    self.receive_stats.disco_confirmed += 1;
+                }
             }
             (3, Path::Derp(_, _)) => {
                 let (addresses, remainder) = message[2..].as_chunks::<18>();
@@ -1012,13 +1033,13 @@ impl Engine {
                     .filter_map(|bytes| discovery::address(bytes))
                     .take(16)
                     .collect();
-                self.probe(identity).await;
+                self.probe(identity, None).await;
             }
             _ => {}
         }
     }
 
-    async fn probe(&mut self, identity: u64) {
+    async fn probe(&mut self, identity: u64, heartbeat: Option<SocketAddr>) {
         let Some(peer) = self.peers.get_mut(&identity) else {
             return;
         };
@@ -1027,7 +1048,13 @@ impl Engine {
         };
         peer.probes
             .retain(|(_, _, sent)| sent.elapsed() < Duration::from_secs(10));
-        for target in peer.endpoints() {
+        // 全量发现仍每十秒执行；已确认路径要在 6.5 秒信任到期前单独保活。
+        // 候选探测积压不能饿死保活，最多替换一个最旧事务，不延长任何旧 Pong 的权限。
+        if heartbeat.is_some() && peer.probes.len() >= 32 {
+            peer.probes.pop_front();
+        }
+        let targets = heartbeat.map_or_else(|| peer.endpoints(), |target| vec![target]);
+        for target in targets {
             if peer.probes.len() >= 32 {
                 break;
             }
@@ -1069,7 +1096,7 @@ impl Engine {
                 self.transmit(identity, None, &bytes).await;
             }
             if self.ticks % 10 == 1 {
-                self.probe(identity).await;
+                self.probe(identity, None).await;
                 let peer = &self.peers[&identity];
                 if let Some(disco) = peer.disco {
                     let endpoints = self
@@ -1087,6 +1114,8 @@ impl Engine {
                         self.hub.send(peer.node.relay_region(), peer.key, &bytes);
                     }
                 }
+            } else if let Some(target) = self.peers[&identity].heartbeat_target(Instant::now()) {
+                self.probe(identity, Some(target)).await;
             }
         }
         if self.ticks % 30 == 1 {
@@ -1169,7 +1198,7 @@ impl Engine {
             "relay":{"home_region":self.hub.home_region(),"connected":self.hub.home_region()!=0},
             "bytes_received":self.received_bytes,"bytes_sent":self.sent_bytes,"advertised_routes":self.config.advertised_routes(),
             "receive_stats":self.receive_stats,
-            "forwarding":{"requested":self.config.advertised_routes(),"active":self.fresh() && self.forwarding.is_some(),"approved":self.forwarding.as_ref().map(|router|&router.plan().routes),"flows":self.forwarding.as_ref().map_or(0,Forwarder::flows)},
+            "forwarding":{"requested":self.config.advertised_routes(),"active":self.fresh() && self.forwarding.is_some(),"approved":self.forwarding.as_ref().map(|router|&router.plan().routes),"flows":self.forwarding.as_ref().map_or(0,Forwarder::flows),"statistics":self.forwarding.as_ref().map(Forwarder::statistics)},
             "self_name":self.map.node.as_ref().map(|node| &node.name),"key_expiry":self.map.node.as_ref().and_then(|node| node.key_expiry.as_ref()),
             "owner_login":self.map.node.as_ref().and_then(|node|self.map.user_profiles.get(&node.user)).map(|profile|&profile.login_name),
             "dns":{"enabled":self.map.dns.proxied,"domains":self.map.dns.domains,"resolvers":self.map.dns.resolver_addresses(),"routes":self.map.dns.route_addresses(),"active":self.fresh() && self.dns.is_some() && (self.config.accept_dns || !self.config.exit_node_id.is_empty()),"address":self.dns.as_ref().map(|dns|dns.plan().address),"dnssec_validate":self.fresh() && self.dns.as_ref().is_some_and(|dns|dns.plan().dnssec_validate) && (self.config.accept_dns || !self.config.exit_node_id.is_empty()),"statistics":self.dns.as_ref().map(DnsProxy::statistics)},
@@ -1299,6 +1328,33 @@ mod tests {
         assert_eq!(peer.direct_address(now + Duration::from_millis(6500)), None);
         peer.probes.push_back(([9; 12], target, now));
         assert!(!peer.confirm_pong(target, &[9; 12], now + Duration::from_secs(10)));
+    }
+
+    #[test]
+    fn direct_heartbeat_renews_before_expiry_but_still_expires_without_a_pong() {
+        let mut peer = exit();
+        peer.disco = Some([3; 32]);
+        let target = "192.0.2.10:41641".parse().unwrap();
+        let now = Instant::now();
+        peer.direct = Some((target, now));
+        assert_eq!(peer.heartbeat_target(now + Duration::from_secs(2)), None);
+        for sequence in 1..=10 {
+            let sent = now + Duration::from_secs(sequence * 3);
+            assert_eq!(peer.heartbeat_target(sent), Some(target));
+            let transaction = [sequence as u8; 12];
+            peer.probes.push_back((transaction, target, sent));
+            assert_eq!(peer.heartbeat_target(sent), None);
+            assert!(peer.confirm_pong(target, &transaction, sent));
+            assert_eq!(peer.direct_address(sent), Some(target));
+        }
+        let sent = now + Duration::from_secs(33);
+        peer.probes.push_back(([11; 12], target, sent));
+        peer.authenticated_udp(target, now + Duration::from_secs(36));
+        assert_eq!(peer.direct_address(now + Duration::from_secs(37)), None);
+        assert_eq!(peer.heartbeat_target(now + Duration::from_secs(37)), None);
+        peer.disco = None;
+        peer.direct = Some((target, now));
+        assert_eq!(peer.heartbeat_target(now + Duration::from_secs(3)), None);
     }
 
     #[test]

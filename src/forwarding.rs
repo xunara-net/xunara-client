@@ -28,6 +28,8 @@ use crate::{config::Config, filter::Packet, model::NetworkMap, packet_stack::Que
 
 const FLOW_LIMIT: usize = 128;
 const PEER_LIMIT: usize = 32;
+const DNS_FLOW_LIMIT: usize = 64;
+const DNS_PEER_LIMIT: usize = 32;
 pub const PEER_API_PORT: u16 = 44444;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -222,6 +224,12 @@ struct Flow {
     seen: Instant,
 }
 
+#[derive(Default, serde::Serialize)]
+pub struct Statistics {
+    data_capacity_drops: u64,
+    dns_capacity_drops: u64,
+}
+
 /// 只接收 Engine 已完成机器来源与 ACL 校验的包；没有监听物理网卡的代理端口。
 /// 每条流独立用户态栈和受保护 socket，回包始终绑定原始 WireGuard peer。
 pub struct Forwarder {
@@ -232,6 +240,8 @@ pub struct Forwarder {
     started: Instant,
     budget_at: Instant,
     budget: usize,
+    dns_budget: usize,
+    statistics: Statistics,
     next_id: u64,
     dns: Option<mpsc::Sender<crate::dns_stack::ApiRequest>>,
     api_tasks: JoinSet<(u64, Vec<u8>)>,
@@ -247,6 +257,8 @@ impl Forwarder {
             started: Instant::now(),
             budget_at: Instant::now(),
             budget: 64,
+            dns_budget: 64,
+            statistics: Statistics::default(),
             next_id: 0,
             dns: None,
             api_tasks: JoinSet::new(),
@@ -263,6 +275,10 @@ impl Forwarder {
         self.flows.len() + self.pings.len()
     }
 
+    pub fn statistics(&self) -> &Statistics {
+        &self.statistics
+    }
+
     pub fn ingest(&mut self, peer: u64, bytes: &[u8]) {
         let Some(packet) = Packet::parse(bytes).filter(|packet| self.plan.handles(*packet)) else {
             return;
@@ -277,16 +293,40 @@ impl Forwarder {
         if self.budget_at.elapsed() >= Duration::from_secs(1) {
             self.budget_at = Instant::now();
             self.budget = 64;
+            self.dns_budget = 64;
         }
-        if self.budget == 0
-            || self.flows.len() >= FLOW_LIMIT
-            || self.connects.len() >= FLOW_LIMIT
-            || self.api_tasks.len() >= FLOW_LIMIT
-            || self.flows.values().filter(|flow| flow.peer == peer).count() >= PEER_LIMIT
-        {
-            return;
+        let dns = self.plan.peer_dns(packet);
+        let mut class_count = 0;
+        let mut peer_count = 0;
+        for flow in self.flows.values() {
+            if matches!(flow.backend, Backend::Api { .. }) == dns {
+                class_count += 1;
+                peer_count += usize::from(flow.peer == peer);
+            }
         }
-        self.budget -= 1;
+        // DNS 是出口的引导服务，不能被浏览器空闲 TCP / QUIC 流占满业务额度后饿死。
+        // 两类分别限流与限额；DNS 仍只接受经过原有机器身份、来源和 ACL 校验的 peerapi。
+        if dns {
+            if self.dns_budget == 0
+                || class_count >= DNS_FLOW_LIMIT
+                || peer_count >= DNS_PEER_LIMIT
+                || self.api_tasks.len() >= DNS_FLOW_LIMIT
+            {
+                self.statistics.dns_capacity_drops += 1;
+                return;
+            }
+            self.dns_budget -= 1;
+        } else {
+            if self.budget == 0
+                || class_count >= FLOW_LIMIT
+                || peer_count >= PEER_LIMIT
+                || self.connects.len() >= FLOW_LIMIT
+            {
+                self.statistics.data_capacity_drops += 1;
+                return;
+            }
+            self.budget -= 1;
+        }
         if matches!(packet.protocol, 1 | 58) {
             if self.pings.len() < 16
                 && let Some(reply) = echo_reply(bytes)
@@ -898,6 +938,10 @@ mod tests {
     }
 
     fn client(target: SocketAddr, protocol: u8) -> (Packet, Stack) {
+        client_from_port(target, protocol, 40960)
+    }
+
+    fn client_from_port(target: SocketAddr, protocol: u8, source_port: u16) -> (Packet, Stack) {
         let source: IpAddr = if target.is_ipv4() {
             "100.80.0.9"
         } else {
@@ -909,7 +953,7 @@ mod tests {
             source,
             destination: target.ip(),
             protocol,
-            source_port: 40960,
+            source_port,
             destination_port: target.port(),
         };
         let reverse = Packet {
@@ -986,7 +1030,7 @@ mod tests {
 
     #[tokio::test]
     async fn peerapi_doh_get_and_post_use_the_same_magicdns_resolver_without_physical_listener() {
-        for post in [false, true] {
+        for (post, occupied_peers) in [(false, 0), (true, 0), (true, 1), (true, 2), (true, 4)] {
             let mut map = map();
             let node = map.node.as_mut().unwrap();
             node.name = "phone.core.test.".into();
@@ -1002,6 +1046,32 @@ mod tests {
                 ..Config::default()
             };
             let mut router = Forwarder::new(Plan::new(&config, &map).unwrap().unwrap());
+            let mut held = Vec::new();
+            if occupied_peers > 0 {
+                router
+                    .plan
+                    .blocked
+                    .retain(|route| *route != "127.0.0.0/8".parse::<IpNet>().unwrap());
+                for index in 0..PEER_LIMIT * occupied_peers {
+                    if index == 64 {
+                        router.budget_at -= Duration::from_secs(1);
+                    }
+                    let backend = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+                    let target = backend.local_addr().unwrap();
+                    let (_, mut sender) = client(target, 17);
+                    sender
+                        .sockets
+                        .get_mut::<udp::Socket>(sender.handle)
+                        .send_slice(b"occupied", target)
+                        .unwrap();
+                    sender.poll(router.now());
+                    for packet in sender.device.output.drain(..) {
+                        router.ingest(7 + (index / PEER_LIMIT) as u64, &packet);
+                    }
+                    held.push(backend);
+                }
+                assert_eq!(router.flows(), PEER_LIMIT * occupied_peers);
+            }
             let mut dns = crate::dns_stack::DnsProxy::new(
                 crate::dns::DnsPlan::new(&config, &map, &[], &[])
                     .unwrap()
@@ -1057,6 +1127,56 @@ mod tests {
             assert_eq!(answer.metadata.id, 1234);
             assert!(!answer.answers.is_empty());
         }
+    }
+
+    #[tokio::test]
+    async fn peerapi_capacity_is_bounded_per_peer_and_globally_without_consuming_data_slots() {
+        let mut map = map();
+        map.node.as_mut().unwrap().allowed_ips.extend([
+            "0.0.0.0/0".parse::<IpNet>().unwrap(),
+            "::/0".parse::<IpNet>().unwrap(),
+        ]);
+        let config = Config {
+            advertise_exit: true,
+            ..Config::default()
+        };
+        let mut router = Forwarder::new(Plan::new(&config, &map).unwrap().unwrap());
+        let target = SocketAddr::new("100.80.0.1".parse().unwrap(), PEER_API_PORT);
+        for (peer, attempts, accepted) in [
+            (7, DNS_PEER_LIMIT + 1, DNS_PEER_LIMIT),
+            (8, DNS_PEER_LIMIT, DNS_FLOW_LIMIT),
+            (9, 1, DNS_FLOW_LIMIT),
+        ] {
+            for _ in 0..attempts {
+                let port = 40000 + router.next_id as u16;
+                let (_, mut sender) = client_from_port(target, 6, port);
+                sender.poll(router.now());
+                for packet in sender.device.output.drain(..) {
+                    router.ingest(peer, &packet);
+                }
+            }
+            assert_eq!(router.flows(), accepted);
+        }
+        assert_eq!(router.statistics.dns_capacity_drops, 2);
+        assert_eq!(router.budget, 64);
+        let backend = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        router
+            .plan
+            .blocked
+            .retain(|route| *route != "127.0.0.0/8".parse::<IpNet>().unwrap());
+        let target = backend.local_addr().unwrap();
+        let (_, mut sender) = client(target, 17);
+        sender
+            .sockets
+            .get_mut::<udp::Socket>(sender.handle)
+            .send_slice(b"data", target)
+            .unwrap();
+        sender.poll(router.now());
+        for packet in sender.device.output.drain(..) {
+            router.ingest(7, &packet);
+        }
+        assert_eq!(router.flows(), DNS_FLOW_LIMIT + 1);
+        assert_eq!(router.statistics.data_capacity_drops, 0);
     }
 
     #[tokio::test]

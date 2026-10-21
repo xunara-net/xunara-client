@@ -8,7 +8,43 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
+
+	"golang.org/x/net/dns/dnsmessage"
 )
+
+func TestUDPCapacityProbeUsesBoundedDistinctFlows(test *testing.T) {
+	server, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		test.Fatal(err)
+	}
+	defer server.Close()
+	if err := udpCapacityProbe(context.Background(), server.LocalAddr().String()); err != nil {
+		test.Fatal(err)
+	}
+	server.SetReadDeadline(time.Now().Add(time.Second))
+	remotes := map[string]bool{}
+	buffer := make([]byte, 512)
+	for attempt := 0; attempt < 33; attempt++ {
+		length, remote, err := server.ReadFrom(buffer)
+		if err != nil {
+			test.Fatal(err)
+		}
+		var query dnsmessage.Message
+		if err := query.Unpack(buffer[:length]); err != nil || len(query.Questions) != 1 {
+			test.Fatal("probe did not send a valid single-question DNS packet")
+		}
+		remotes[remote.String()] = true
+	}
+	if len(remotes) != 33 {
+		test.Fatalf("expected 33 distinct UDP flows, got %d", len(remotes))
+	}
+	for _, invalid := range []string{"resolver.test:53", "127.0.0.1:0", "224.0.0.1:53", "[::1]:53"} {
+		if err := udpCapacityProbe(context.Background(), invalid); err == nil {
+			test.Fatalf("invalid endpoint accepted: %s", invalid)
+		}
+	}
+}
 
 func TestDNSBurstQueriesItsExplicitResolverWithoutAnApplicationCache(test *testing.T) {
 	server, err := net.ListenPacket("udp", "127.0.0.1:0")

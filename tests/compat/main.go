@@ -22,6 +22,8 @@ import (
 	"syscall"
 	"time"
 
+	"golang.org/x/net/dns/dnsmessage"
+
 	"github.com/xunara-net/xunara-server/control"
 	"github.com/xunara-net/xunara-server/identity"
 	"github.com/xunara-net/xunara-server/state"
@@ -34,7 +36,7 @@ import (
 )
 
 func main() {
-	mode := flag.String("mode", "fixture", "fixture | proxy | http | official | exit | phone | dns | udp-error | web-probe | dns-burst | live-probe | stun-vector | masq-vector")
+	mode := flag.String("mode", "fixture", "fixture | proxy | http | official | exit | phone | dns | udp-error | web-probe | dns-burst | udp-capacity | live-probe | stun-vector | masq-vector")
 	directory := flag.String("dir", "", "private test directory")
 	listen := flag.String("listen", "127.0.0.1:18080", "test listen address")
 	target := flag.String("target", "", "test proxy/HTTP target")
@@ -65,6 +67,8 @@ func main() {
 		err = webProbe(ctx, *listen, *target)
 	case "dns-burst":
 		err = dnsBurst(ctx, *listen, *target, 64)
+	case "udp-capacity":
+		err = udpCapacityProbe(ctx, *target)
 	case "live-probe":
 		err = liveProbe(ctx, *directory)
 	case "stun-vector":
@@ -84,6 +88,42 @@ func main() {
 	if err != nil && ctx.Err() == nil {
 		log.Fatal(err)
 	}
+}
+
+func udpCapacityProbe(ctx context.Context, target string) error {
+	endpoint, err := netip.ParseAddrPort(target)
+	if err != nil || !endpoint.Addr().Is4() || endpoint.Addr().IsUnspecified() || endpoint.Addr().IsMulticast() || endpoint.Port() == 0 {
+		return errors.New("UDP capacity probe requires a numeric unicast IPv4 endpoint")
+	}
+	query := dnsmessage.Message{Header: dnsmessage.Header{ID: 1234, RecursionDesired: true}, Questions: []dnsmessage.Question{{Name: dnsmessage.MustNewName("cloudflare.com."), Type: dnsmessage.TypeA, Class: dnsmessage.ClassINET}}}
+	wire, err := query.Pack()
+	if err != nil {
+		return err
+	}
+	probe, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	var connections []net.Conn
+	defer func() {
+		for _, connection := range connections {
+			connection.Close()
+		}
+	}()
+	for attempt := 0; attempt < 33; attempt++ {
+		connection, err := (&net.Dialer{}).DialContext(probe, "udp4", target)
+		if err != nil {
+			return err
+		}
+		connections = append(connections, connection)
+		deadline, _ := probe.Deadline()
+		if err := connection.SetWriteDeadline(deadline); err != nil {
+			return err
+		}
+		if _, err := connection.Write(wire); err != nil {
+			return err
+		}
+	}
+	fmt.Println("PASS sent 33 bounded UDP flow probes; exit counters must confirm saturation")
+	return nil
 }
 
 func dnsBurst(ctx context.Context, dnsAddress, name string, count int) error {

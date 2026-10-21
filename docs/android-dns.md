@@ -1,5 +1,38 @@
 # Android MagicDNS 与出口解析修复
 
+## 复审：出口 DNS 与上网连接容量隔离
+
+### What changed
+
+出口 peerapi 的连接额度和每秒新建预算独立于 TCP / UDP 上网转发。业务仍为全局 128、每设备 32；DNS 为全局 64、每设备 32，两类新建预算各为每秒 64。没有扩大任何访问权限，也没有新增物理 DNS 监听端口。诊断提供两类容量拒绝计数，便于区别 DNS 服务拥塞和上游解析错误。
+
+已确认 UDP 路径增加三秒保活，全量候选发现仍每十秒执行。6.5 秒信任期限不变；只有新鲜、地址匹配、单次消费的 Pong 能续期。移除“只有十秒全量发现才刷新路径”的旧调度；不通过延长信任或信任任意来包掩盖单向 UDP 故障。
+
+### Why
+
+重新检查 Flutter 配置、Kotlin VpnService、JNI、Engine、DnsProxy、Forwarder 与固定官方源码后，确认 Flutter 没有另一份 DNS 转发实现；最近的超时、连接回收和候选学习修复都不足以解决出口业务额度被占满的问题。
+
+现网专用模拟器使用原样 NX769J 出口：普通并发 DNS 正常，Chrome 两次非缓存 `odata.cc` 导航也取得 200，但累计诊断仍出现 46 次 SERVFAIL、89 次建连超时。因此单凭页面打开或顺序查询成功不能验收。随后仅让临时使用端向自有服务器产生 32 条普通 UDP 流，同一设备的 A / AAAA / HTTPS 记录查询均超过 16 秒未收到响应；后续查询恢复时仍有 4–12 秒延迟。该测试没有修改原手机、生产 DNS、ACL 或设备审批。
+
+原 `Forwarder::ingest` 用同一个每设备 32 条额度接纳业务和 peerapi，普通流可把 DNS SYN 全部挡在门外。回归用真实 TCP / UDP 报文占满业务流后访问 peerapi：旧逻辑无响应，隔离后正常返回 DNS。另发现直连确认有效期短于全量发现周期，缺少官方三秒心跳；这属于独立链路缺陷，不能仅凭它认定原手机 DNS 已修复。
+
+### Compatibility impact
+
+参考固定上游 [peerapi DNS](https://github.com/tailscale/tailscale/blob/v1.98.8/ipn/ipnlocal/peerapi.go)、[netstack 接入](https://github.com/tailscale/tailscale/blob/v1.98.8/wgengine/netstack/netstack.go)与[UDP 心跳](https://github.com/tailscale/tailscale/blob/v1.98.8/wgengine/magicsock/endpoint.go)。不修改 TS2021、Noise、DNSConfig、WireGuard、Disco 或 DERP wire。保留已有 DNS 终止帧回收和受控上游查询，不引入备用公网 DNS 或另一套协议内核。
+
+容量修复在提供出口的客户端生效；只更新使用端不能修复旧出口。统计是固定非负整数，不记录域名、IP、报文或密钥。DNS 与业务都继续受机器来源、租户映射、ACL 和出口批准约束，撤销后仍关闭。
+
+### Security impact
+
+两类额度、速率、任务数和报文长度均有界；满额拒绝不能扩大到未授权网络。候选队列满时最多替换最旧探测事务，旧 Pong 不能重放续期；无响应时仍及时回退中继。原有地址族、TLS 验证和 DNSSEC 策略不变。
+
+### Tests
+
+- DNS 容量回归在旧实现失败；新实现覆盖每设备额度、全局额度、新建速率耗尽，以及 DNS 自身配额不能被绕过。
+- Rust fmt / clippy / 全目标测试和显式官方兼容向量；真实 netns 覆盖持续 TCP 下的直连刷新、单向 UDP、DERP 回退、官方 tsnet、ACL、子网和恢复。
+- 最初的直连测试把首次发现前的状态误当成已经建立的路径，不能作为有效红绿证据；已先等待真实确认，再检查后续连续快照。未把失败记录删除或改判通过。
+- Android 双设备和最终安装包验收另见应用仓库。使用端原手机本轮在线但 SSH / ICMP 暂不可达；不能把独立模拟器结果表述为原手机已经恢复。
+
 ## 现网出口建连预算与 NAT 候选回程
 
 ### What changed
