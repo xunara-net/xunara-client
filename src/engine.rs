@@ -65,6 +65,7 @@ struct Peer {
     direct: Option<(SocketAddr, Instant)>,
     probes: VecDeque<([u8; 12], SocketAddr, Instant)>,
     extra_endpoints: Vec<SocketAddr>,
+    observed_endpoints: VecDeque<(SocketAddr, Instant)>,
 }
 
 impl Peer {
@@ -84,7 +85,36 @@ impl Peer {
         // 无 Disco 的纯 WireGuard 对端才短暂沿用已认证的源地址。
         if self.disco.is_none() {
             self.direct = Some((source, now));
+        } else {
+            self.observe_endpoint(source, now);
         }
+    }
+
+    fn observe_endpoint(&mut self, source: SocketAddr, now: Instant) -> bool {
+        if !source.is_ipv4()
+            || source.port() == 0
+            || source.ip().is_loopback()
+            || source.ip().is_unspecified()
+            || source.ip().is_multicast()
+        {
+            return false;
+        }
+        self.observed_endpoints
+            .retain(|(_, seen)| now.saturating_duration_since(*seen) < Duration::from_secs(120));
+        if let Some((_, seen)) = self
+            .observed_endpoints
+            .iter_mut()
+            .find(|(address, _)| *address == source)
+        {
+            *seen = now;
+            return false;
+        }
+        if self.observed_endpoints.len() == 8 {
+            self.observed_endpoints.pop_front();
+        }
+        // 认证来包只提供 NAT 候选；仍须新的、地址匹配且一次性的 Pong 才能启用直连。
+        self.observed_endpoints.push_back((source, now));
+        true
     }
 
     fn confirm_pong(&mut self, source: SocketAddr, transaction: &[u8], now: Instant) -> bool {
@@ -120,9 +150,16 @@ impl Peer {
     }
 
     fn endpoints(&self) -> Vec<SocketAddr> {
-        self.node
-            .endpoints
+        let now = Instant::now();
+        let mut seen = BTreeSet::new();
+        self.observed_endpoints
             .iter()
+            .rev()
+            .filter(|(_, observed)| {
+                now.saturating_duration_since(*observed) < Duration::from_secs(120)
+            })
+            .map(|(address, _)| address)
+            .chain(self.node.endpoints.iter())
             .chain(&self.extra_endpoints)
             .filter(|address| {
                 address.is_ipv4()
@@ -132,8 +169,7 @@ impl Peer {
                     && address.port() != 0
             })
             .copied()
-            .collect::<BTreeSet<_>>()
-            .into_iter()
+            .filter(|address| seen.insert(*address))
             .take(16)
             .collect()
     }
@@ -475,6 +511,7 @@ impl Engine {
                     direct: None,
                     probes: VecDeque::new(),
                     extra_endpoints: Vec::new(),
+                    observed_endpoints: VecDeque::new(),
                 },
             );
         }
@@ -953,9 +990,13 @@ impl Engine {
                 {
                     return;
                 }
+                let discovered = peer.observe_endpoint(source, Instant::now());
                 let pong = discovery::pong(&message[2..14], source);
                 if let Some(bytes) = discovery::seal(&self.identity.disco, &disco, &pong) {
                     let _ = self.socket.send_to(&bytes, source).await;
+                }
+                if discovered {
+                    self.probe(identity).await;
                 }
             }
             (2, Path::Udp(source)) if message.len() >= 32 => {
@@ -1176,6 +1217,7 @@ mod tests {
             direct: None,
             probes: VecDeque::new(),
             extra_endpoints: Vec::new(),
+            observed_endpoints: VecDeque::new(),
         }
     }
 
@@ -1187,12 +1229,55 @@ mod tests {
         let now = Instant::now();
         peer.authenticated_udp(source, now);
         assert_eq!(peer.direct_address(now), None);
+        assert!(
+            peer.endpoints().contains(&source),
+            "authenticated UDP sources must remain candidates for a fresh round-trip challenge"
+        );
         peer.direct = Some((source, now));
         peer.authenticated_udp(source, now + Duration::from_secs(6));
         assert_eq!(peer.direct_address(now + Duration::from_millis(6500)), None);
         let other = "192.0.2.11:41641".parse().unwrap();
         peer.authenticated_udp(other, now + Duration::from_secs(7));
         assert_eq!(peer.direct, Some((source, now)));
+    }
+
+    #[test]
+    fn observed_nat_candidates_are_bounded_prioritized_and_never_trusted_without_pong() {
+        let mut peer = exit();
+        peer.disco = Some([3; 32]);
+        let now = Instant::now();
+        peer.node.endpoints = (1..=16)
+            .map(|last| format!("192.0.2.{last}:41641").parse().unwrap())
+            .collect();
+        for last in 1..=9 {
+            peer.authenticated_udp(format!("198.51.100.{last}:41641").parse().unwrap(), now);
+        }
+        assert_eq!(peer.observed_endpoints.len(), 8);
+        assert_eq!(peer.endpoints().len(), 16);
+        let newest = "198.51.100.9:41641".parse().unwrap();
+        assert_eq!(peer.endpoints()[0], newest);
+        assert!(
+            !peer
+                .endpoints()
+                .contains(&"198.51.100.1:41641".parse().unwrap())
+        );
+        assert!(!peer.observe_endpoint(newest, now));
+        assert_eq!(peer.direct_address(now), None);
+        for invalid in [
+            "127.0.0.1:41641",
+            "0.0.0.0:41641",
+            "224.0.0.1:41641",
+            "192.0.2.1:0",
+            "[::1]:41641",
+        ] {
+            assert!(!peer.observe_endpoint(invalid.parse().unwrap(), now));
+        }
+        assert_eq!(peer.observed_endpoints.len(), 8);
+        for (_, seen) in &mut peer.observed_endpoints {
+            *seen = now - Duration::from_secs(121);
+        }
+        assert!(!peer.endpoints().contains(&newest));
+        assert_eq!(peer.direct_address(now), None);
     }
 
     #[test]

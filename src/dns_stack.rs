@@ -36,6 +36,10 @@ pub struct Statistics {
     servfail: u64,
     nxdomain: u64,
     timeouts: u64,
+    connect_timeouts: u64,
+    response_timeouts: u64,
+    upstream_closed: u64,
+    invalid_responses: u64,
     peer_queries: u64,
     peer_responses: u64,
     peer_servfail: u64,
@@ -382,29 +386,32 @@ impl DnsProxy {
                         }
                     }
                 }
-                let response = upstream_response(
-                    &upstream.target,
-                    &upstream.input,
-                    !socket.may_recv()
-                        && !matches!(
-                            socket.state(),
-                            tcp::State::SynSent | tcp::State::SynReceived
-                        ),
-                );
+                let closed = !socket.may_recv()
+                    && !matches!(
+                        socket.state(),
+                        tcp::State::SynSent | tcp::State::SynReceived
+                    );
+                let response = upstream_response(&upstream.target, &upstream.input, closed);
                 match response {
                     Ok(Some(bytes)) => match dns::verified(&pending.query, &bytes) {
                         Ok(response) => completed.push((*id, response)),
-                        Err(_) => failed.push(*id),
+                        Err(_) => {
+                            self.statistics.invalid_responses += 1;
+                            failed.push(*id);
+                        }
                     },
-                    Err(_) => failed.push(*id),
+                    Err(_) => {
+                        if closed {
+                            self.statistics.upstream_closed += 1;
+                        } else {
+                            self.statistics.invalid_responses += 1;
+                        }
+                        failed.push(*id);
+                    }
                     Ok(None) => {
-                        // 官方 peerapi 自身允许五秒解析，不能在连接成功后仍用四秒总预算提前撤销。
-                        // 建连仍有短超时；已连接出口沿用官方 DNS 的十秒上限，不回退手机原网络。
-                        let budget = if matches!(upstream.target, Target::PeerHttp(_))
-                            && !matches!(
-                                socket.state(),
-                                tcp::State::SynSent | tcp::State::SynReceived
-                            ) {
+                        // 中继建连和出口解析共享官方 DNS 的十秒总预算。
+                        // 不能在 SYN 重传期间提前丢弃请求；握手后也不能重新计时延长上限。
+                        let budget = if matches!(upstream.target, Target::PeerHttp(_)) {
                             Duration::from_secs(10)
                         } else {
                             Duration::from_secs(4)
@@ -413,6 +420,16 @@ impl DnsProxy {
                         if timed_out || !socket.is_open() {
                             if timed_out {
                                 self.statistics.timeouts += 1;
+                                if matches!(
+                                    socket.state(),
+                                    tcp::State::SynSent | tcp::State::SynReceived
+                                ) {
+                                    self.statistics.connect_timeouts += 1;
+                                } else {
+                                    self.statistics.response_timeouts += 1;
+                                }
+                            } else {
+                                self.statistics.upstream_closed += 1;
                             }
                             failed.push(*id);
                         }
@@ -1414,6 +1431,56 @@ mod tests {
     }
 
     #[test]
+    fn exit_dns_handshake_shares_the_full_bounded_query_budget() {
+        let mut server = proxy();
+        let mut query = Message::query();
+        query.queries.push(Query::query(
+            Name::from_ascii("external.public.test.").unwrap(),
+            RecordType::A,
+        ));
+        let (sender, mut response) = oneshot::channel();
+        server.request(Client::Api(sender), query);
+        let identity = server.next_id;
+        server
+            .pending
+            .get_mut(&identity)
+            .unwrap()
+            .targets
+            .push_back(Target::PeerHttp("100.80.0.2:44444".parse().unwrap()));
+        server.forward(identity);
+        server
+            .pending
+            .get_mut(&identity)
+            .unwrap()
+            .upstream
+            .as_mut()
+            .unwrap()
+            .started = Instant::now() - Duration::from_millis(4500);
+        server.poll();
+        assert!(
+            server.pending.contains_key(&identity),
+            "an exit DNS handshake must not discard its SYN before the official query budget expires"
+        );
+        assert!(response.try_recv().is_err());
+        assert_eq!(server.statistics.connect_timeouts, 0);
+        server
+            .pending
+            .get_mut(&identity)
+            .unwrap()
+            .upstream
+            .as_mut()
+            .unwrap()
+            .started = Instant::now() - Duration::from_secs(11);
+        server.poll();
+        assert_eq!(
+            response.try_recv().unwrap().metadata.response_code,
+            ResponseCode::ServFail
+        );
+        assert_eq!(server.statistics.connect_timeouts, 1);
+        assert!(!server.pending.contains_key(&identity));
+    }
+
+    #[test]
     fn statistics_separate_queries_responses_timeouts_and_internal_requests() {
         let mut server = proxy();
         let client = || Client::Udp(IpEndpoint::new("100.80.0.1".parse().unwrap(), 53000), 512);
@@ -1444,12 +1511,12 @@ mod tests {
             .upstream
             .as_mut()
             .unwrap()
-            .started = Instant::now() - Duration::from_secs(5);
+            .started = Instant::now() - Duration::from_secs(11);
         server.poll();
         let statistics = serde_json::to_value(server.statistics()).unwrap();
         assert_eq!(
             statistics,
-            json!({"queries":3,"responses":3,"servfail":1,"nxdomain":1,"timeouts":1,"peer_queries":1,"peer_responses":1,"peer_servfail":0})
+            json!({"queries":3,"responses":3,"servfail":1,"nxdomain":1,"timeouts":1,"connect_timeouts":1,"response_timeouts":0,"upstream_closed":0,"invalid_responses":0,"peer_queries":1,"peer_responses":1,"peer_servfail":0})
         );
     }
 

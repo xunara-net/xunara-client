@@ -1,5 +1,34 @@
 # Android MagicDNS 与出口解析修复
 
+## 现网出口建连预算与 NAT 候选回程
+
+### What changed
+
+- 选定出口的 DNS-over-WireGuard 从 TCP SYN 开始使用每个上游尝试十秒的预算，不在握手后重新计时；移除握手阶段单独四秒提前失败的旧分支。
+- DNS 快照区分建连超时、响应超时、提前关闭及无效响应，只增加固定整数计数，不记录查询名、地址、HTTP 内容或密钥。
+- 经过既有 WireGuard 认证或合法 Disco Ping 验证的实际 UDP 来源可成为短期 NAT 候选，优先参加新的往返探测。最多保存八个候选、有效期两分钟；完整目标清单仍不超过十六项。
+
+### Why
+
+专用 Android 36 模拟器实际接入现网 NX769J 后，0.5.8 仍出现 `odata.cc` 系统解析失败及 SERVFAIL；同一模拟器切换官方 Android 1.98.8、选择同一出口后，系统解析和 DNS UDP / TCP 可用。新增脱敏统计确认多次失败发生于 SYN 阶段，而不是无效 DNS 响应或身份审批。
+
+单独延长预算后的现网连续查询仍有一次超时，不能据此宣布完成。继续对照上游发现，旧实现只回 Pong，却没有把实际认证来包来源加入后续探测；NAT 实际映射不一定等于控制面或 STUN 公告的地址。新增候选后仍必须取得匹配当前目标及一次性事务的 Pong，不能把收到来包直接当成双向直连。
+
+### Compatibility impact
+
+对照固定版本官方 [DNS 查询预算](https://github.com/tailscale/tailscale/blob/v1.98.8/net/dns/resolver/tsdns.go)及[认证 Ping 候选学习](https://github.com/tailscale/tailscale/blob/v1.98.8/wgengine/magicsock/magicsock.go)。不修改 TS2021、Noise、MapResponse、WireGuard、Disco、STUN、DNSConfig 或 DERP wire。普通解析器预算、出口选择和 LAN 避让不变；不可达的不同地址族可能依次尝试，不宣称整个多地址查询只有十秒。
+
+### Security impact
+
+未知、过期、错误事务或源地址不匹配的 Pong 仍不能建立或延长直连。候选不跨节点密钥或租户复用，不接受回环、多播、未指定地址或零端口；候选学习不授予 ACL、机器或人类身份权限。出口不可用仍失败关闭，不切换到手机物理 DNS 或其他出口。
+
+### Tests
+
+- 两项回归分别在旧握手预算和旧候选学习行为上失败；修复后通过。另覆盖候选容量、优先级、过期、无效地址及仍须 Pong 认证的边界。
+- Rust fmt / clippy / 全目标测试；显式运行官方 STUN / 共享地址向量；Go 夹具 build / vet / test / race；真实隔离 TUN、官方 tsnet、ACL、子网、单向 UDP、DERP 回退与恢复通过。
+- 现网混合测试首轮完成独立使用端 64 次 `odata.cc` UDP DNS 查询，64 次有效答复；此时所选 NX769J 路径仍报告中继，不将候选学习单测冒充该手机已建立 UDP 直连。
+- 浏览器与最终 APK 的后续验收记录在 Android 仓库；物理使用端尚未安装本轮内核，不能宣称原手机问题全部消失。
+
 ## What changed
 
 - 保留现有本机 MagicDNS、设备正向 / 反向记录、搜索域和权威 NXDOMAIN；不把 Go 客户端或第二套协议内核塞进 Rust 最小客户端。
