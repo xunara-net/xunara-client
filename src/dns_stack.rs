@@ -81,6 +81,7 @@ pub struct DnsProxy {
     udp: SocketHandle,
     listeners: Vec<Listener>,
     pending: BTreeMap<u64, Pending>,
+    retired: Vec<SocketHandle>,
     tasks: JoinSet<(u64, Result<Message>)>,
     next_id: u64,
     next_port: u16,
@@ -173,6 +174,7 @@ impl DnsProxy {
             udp,
             listeners,
             pending: BTreeMap::new(),
+            retired: Vec::new(),
             tasks: JoinSet::new(),
             next_id: 0,
             next_port: 49152 + (OsRng.next_u32() % 8192) as u16,
@@ -435,6 +437,20 @@ impl DnsProxy {
         }
         self.interface
             .poll(now, &mut self.device, &mut self.sockets);
+        // abort 后 tuple 直到 RST 入队才清空；is_open 已经为 false，不能据此提前回收。
+        self.retired.retain(|handle| {
+            if self
+                .sockets
+                .get::<tcp::Socket>(*handle)
+                .remote_endpoint()
+                .is_none()
+            {
+                self.sockets.remove(*handle);
+                false
+            } else {
+                true
+            }
+        });
         self.device.output.drain(..).collect()
     }
 
@@ -485,6 +501,10 @@ impl DnsProxy {
     }
 
     fn forward(&mut self, id: u64) {
+        // 终止帧受回压时暂停新连接，保留待选解析器，不另建无界清理队列。
+        if self.retired.len() >= LIMIT {
+            return;
+        }
         let Some(pending) = self.pending.get_mut(&id) else {
             return;
         };
@@ -568,7 +588,10 @@ impl DnsProxy {
             .get_mut(&id)
             .and_then(|pending| pending.upstream.take())
         {
-            self.sockets.remove(upstream.handle);
+            // SocketSet::remove 不会终止 TCP。先发 RST，再释放句柄，
+            // 否则已完成查询仍占用出口的每设备连接额度，浏览器会逐渐只剩 SERVFAIL。
+            self.sockets.get_mut::<tcp::Socket>(upstream.handle).abort();
+            self.retired.push(upstream.handle);
         }
     }
     fn complete(&mut self, id: u64, response: Message) {
@@ -1142,6 +1165,157 @@ mod tests {
             .unwrap(),
         )
         .unwrap()
+    }
+
+    #[tokio::test]
+    async fn exit_dns_completion_releases_peer_tcp_flows_before_the_next_queries() {
+        let mut client_map = NetworkMap::default();
+        client_map.apply(json!({
+            "Node":{"ID":2,"Name":"client.mesh.test.","Key":"client","MachineAuthorized":true,"Addresses":["100.80.0.2/32"]},
+            "Peers":[{"ID":1,"StableID":"exit","Name":"exit.mesh.test.","Key":"exit","MachineAuthorized":true,"Addresses":["100.80.0.1/32"],"AllowedIPs":["0.0.0.0/0","::/0"],"Hostinfo":{"Services":[{"Proto":"peerapi4","Port":44444}]}}]
+        })).unwrap();
+        let mut exit_map = NetworkMap::default();
+        exit_map.apply(json!({
+            "Node":{"ID":1,"Name":"exit.mesh.test.","Key":"exit","MachineAuthorized":true,"Addresses":["100.80.0.1/32"],"AllowedIPs":["0.0.0.0/0","::/0"]},
+            "Peers":[{"ID":2,"Name":"client.mesh.test.","Key":"client","MachineAuthorized":true,"Addresses":["100.80.0.2/32"]}],
+            "DNSConfig":{"ExtraRecords":[{"Name":"public.example","Type":"A","Value":"192.0.2.1"}]}
+        })).unwrap();
+        let client_config = ClientConfig {
+            exit_node_id: "exit".into(),
+            ..ClientConfig::default()
+        };
+        let exit_config = ClientConfig {
+            accept_dns: true,
+            advertise_exit: true,
+            ..ClientConfig::default()
+        };
+        let mut client = DnsProxy::new(
+            DnsPlan::new(&client_config, &client_map, &[], &[])
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap();
+        let mut exit_dns = DnsProxy::new(
+            DnsPlan::new(&exit_config, &exit_map, &[], &[])
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap();
+        let mut router = crate::forwarding::Forwarder::new(
+            crate::forwarding::Plan::new(&exit_config, &exit_map)
+                .unwrap()
+                .unwrap(),
+        );
+        router.set_dns(exit_dns.api_sender());
+        for attempt in 0..48 {
+            let mut query = Message::query();
+            query.queries.push(Query::query(
+                Name::from_ascii("public.example.").unwrap(),
+                RecordType::A,
+            ));
+            let (sender, mut response) = oneshot::channel();
+            client.request(Client::Api(sender), query);
+            let deadline = Instant::now() + Duration::from_millis(800);
+            let answer = loop {
+                assert!(exit_dns.poll().is_empty());
+                for bytes in client.poll() {
+                    router.ingest(2, &bytes);
+                }
+                for (_, bytes) in router.poll() {
+                    client.ingest(&bytes);
+                }
+                if let Ok(answer) = response.try_recv() {
+                    break answer;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "DNS query {attempt} stalled with {} retained exit flows",
+                    router.flows()
+                );
+                tokio::task::yield_now().await;
+            };
+            assert_eq!(answer.metadata.response_code, ResponseCode::NoError);
+            assert_eq!(answer.answers.len(), 1);
+            for _ in 0..8 {
+                for bytes in client.poll() {
+                    router.ingest(2, &bytes);
+                }
+                for (_, bytes) in router.poll() {
+                    client.ingest(&bytes);
+                }
+                tokio::task::yield_now().await;
+            }
+        }
+        assert!(
+            router.flows() <= 1,
+            "completed DNS requests left {} exit flows",
+            router.flows()
+        );
+    }
+
+    #[test]
+    fn completed_upstream_keeps_its_reset_until_output_backpressure_clears() {
+        let mut server = proxy();
+        let mut query = Message::query();
+        query.queries.push(Query::query(
+            Name::from_ascii("public.example.").unwrap(),
+            RecordType::A,
+        ));
+        let (sender, _) = oneshot::channel();
+        server.request(Client::Api(sender), query.clone());
+        let identity = server.next_id;
+        server
+            .pending
+            .get_mut(&identity)
+            .unwrap()
+            .targets
+            .push_back(Target::PeerHttp("100.80.0.2:44444".parse().unwrap()));
+        server.forward(identity);
+        let handle = server.pending[&identity].upstream.as_ref().unwrap().handle;
+        server.device.output.extend((0..256).map(|_| vec![0]));
+        server.complete(identity, dns::reply(&query, ResponseCode::NoError));
+        assert_eq!(server.poll().len(), 256);
+        assert_eq!(server.retired, vec![handle]);
+        assert!(
+            server
+                .sockets
+                .get::<tcp::Socket>(handle)
+                .remote_endpoint()
+                .is_some()
+        );
+        let packets = server.poll();
+        assert!(server.retired.is_empty());
+        assert_eq!(packets.len(), 1);
+        let packet = smoltcp::wire::Ipv4Packet::new_checked(&packets[0][..]).unwrap();
+        let reset = smoltcp::wire::TcpPacket::new_checked(packet.payload()).unwrap();
+        assert!(reset.rst());
+        assert_eq!(reset.dst_port(), 44444);
+    }
+
+    #[test]
+    fn reset_backpressure_does_not_consume_a_pending_resolver_or_allocate_unbounded_sockets() {
+        let mut server = proxy();
+        let mut query = Message::query();
+        query.queries.push(Query::query(
+            Name::from_ascii("public.example.").unwrap(),
+            RecordType::A,
+        ));
+        let (sender, _) = oneshot::channel();
+        server.request(Client::Api(sender), query);
+        let identity = server.next_id;
+        server
+            .pending
+            .get_mut(&identity)
+            .unwrap()
+            .targets
+            .push_back(Target::PeerHttp("100.80.0.2:44444".parse().unwrap()));
+        server
+            .retired
+            .extend((0..LIMIT).map(|_| server.sockets.add(tcp_socket())));
+        server.forward(identity);
+        assert!(server.pending[&identity].upstream.is_none());
+        assert_eq!(server.pending[&identity].targets.len(), 1);
+        assert_eq!(server.sockets.iter().count(), LIMIT + TCP_LIMIT + 1);
     }
 
     #[test]

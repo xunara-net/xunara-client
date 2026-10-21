@@ -3,10 +3,59 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"net"
 	"net/netip"
 	"strings"
+	"sync/atomic"
 	"testing"
 )
+
+func TestDNSBurstQueriesItsExplicitResolverWithoutAnApplicationCache(test *testing.T) {
+	server, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		test.Fatal(err)
+	}
+	var queries atomic.Int32
+	finished := make(chan struct{})
+	go func() {
+		defer close(finished)
+		buffer := make([]byte, 4096)
+		for {
+			length, remote, err := server.ReadFrom(buffer)
+			if err != nil {
+				return
+			}
+			queries.Add(1)
+			answer, err := dnsAnswer(buffer[:length])
+			if err == nil {
+				server.WriteTo(answer, remote)
+			}
+		}
+	}()
+	test.Cleanup(func() { server.Close(); <-finished })
+	if err := dnsBurst(context.Background(), server.LocalAddr().String(), "external.public.test", 4); err != nil {
+		test.Fatal(err)
+	}
+	if queries.Load() < 8 {
+		test.Fatalf("expected fresh A/AAAA queries for every lookup, got %d", queries.Load())
+	}
+}
+
+func TestDNSBurstRejectsUnboundedOrNonNumericInputsBeforeDialing(test *testing.T) {
+	for _, candidate := range []struct {
+		endpoint, name string
+		count          int
+	}{
+		{"resolver.test:53", "external.public.test", 1},
+		{"127.0.0.1:53", "external.public.test", 0},
+		{"127.0.0.1:53", "external.public.test", 129},
+		{"127.0.0.1:53", "", 1},
+	} {
+		if err := dnsBurst(context.Background(), candidate.endpoint, candidate.name, candidate.count); err == nil {
+			test.Fatal("invalid DNS burst input accepted")
+		}
+	}
+}
 
 func TestUnreachableDNSIsLimitedToTheIsolatedAndroidPair(test *testing.T) {
 	for _, enabled := range []string{"", "false", "true"} {

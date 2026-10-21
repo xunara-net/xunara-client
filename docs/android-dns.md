@@ -38,3 +38,27 @@ MagicDNS 和权威 NXDOMAIN 在本地终止。用户显式配置的 DoH / DoT / 
 移动端内存快照单独提供 `dns.resolvers` 和 `dns.routes`，来源仅为已验证网络映射中的全局解析器及分流配置；空的分流上游仍表示本地权威域。页面参考[固定版本官方 Android DNS 设置](https://github.com/tailscale/tailscale-android/blob/1.98.8-t1241b225b-gbcbaf1889/android/src/main/java/com/tailscale/ipn/ui/view/DNSSettingsView.kt)，不把 `dns.address` 的内部 VPN 监听地址展示成上游服务器。
 
 这是本地展示字段，不修改控制面 DNSConfig、解析计划、系统路由或机器身份。内部监听地址保留给系统配置与验收探针，新增上游配置不写入 CLI 持久化状态。单测覆盖解析器、分流的空上游以及 null 保留 / 空对象清空的映射增量语义；元数据测试通过不能作为用户手机 DNS 已修复的证明。
+
+## 出口 DNS 连接清理
+
+### What changed
+
+隧道内 DNS 上游完成或失败时，先由 smoltcp 显式终止 TCP；待终止帧实际入队后，才移除 socket。输出回压期间保留待发送终止帧，并有界暂停新连接，不消耗尚未尝试的解析器。
+
+### Why
+
+原来的 `SocketSet::remove` 仅释放本地对象，不发送 FIN / RST。出口保留已完成查询的 TCP 状态，占满每设备 32 条连接后，后续 DNS 甚至正常出口连接都会等待超时。此前低次数 DNS / HTTPS 测试没有覆盖这种积累。
+
+使用真实 TCP 报文连接本内核的 DNSProxy 与 Forwarder，旧代码在第 33 次查询停滞，出口恰好保留 32 条流；新代码连续完成 48 次并回收连接。真实用户域名也已复现使用端 SERVFAIL、出口系统解析和 HTTPS 成功的差异，但仍需更新物理使用端后复测，不能将单测当成真机结论。
+
+### Compatibility impact
+
+对照[官方 DNS HTTP 客户端](https://github.com/tailscale/tailscale/blob/v1.98.8/net/dns/resolver/forwarder.go)的响应 / 连接关闭，以及固定依赖 smoltcp 0.14.0 的 `abort` / `dispatch` 语义，实现标准 TCP 清理。不改 TS2021、DNSConfig、WireGuard、DNSSEC、ACL 或系统路由，也不提高出口连接配额。终止报文仍走原出口的 WireGuard 与现有来源 / ACL 检查。
+
+### Security impact
+
+选定出口失败仍关闭，不因失败回退手机物理 DNS 或其他设备。保留连接配额与内存边界；已消费完整响应后不保留可继续代理任意业务的旧连接。测试探针仅用于外部 Android shell UID，不进入 APK，不引入 Go sidecar。
+
+### Tests
+
+回归覆盖超过出口单设备限额的连续查询、输出队列满时不丢终止帧、有界回压时不消耗备用解析器。Go 隔离夹具增加固定解析器的连续 64 次 A / AAAA 查询探针；它不使用应用缓存或系统备用解析器，并限制单次及总体期限。实际 TUN / 官方兼容与 Android 验收另记录，不能用本地报文测试替代。

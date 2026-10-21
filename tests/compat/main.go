@@ -34,7 +34,7 @@ import (
 )
 
 func main() {
-	mode := flag.String("mode", "fixture", "fixture | proxy | http | official | exit | phone | dns | udp-error | web-probe | live-probe | stun-vector | masq-vector")
+	mode := flag.String("mode", "fixture", "fixture | proxy | http | official | exit | phone | dns | udp-error | web-probe | dns-burst | live-probe | stun-vector | masq-vector")
 	directory := flag.String("dir", "", "private test directory")
 	listen := flag.String("listen", "127.0.0.1:18080", "test listen address")
 	target := flag.String("target", "", "test proxy/HTTP target")
@@ -63,6 +63,8 @@ func main() {
 		err = udpErrorProbe(ctx, *target)
 	case "web-probe":
 		err = webProbe(ctx, *listen, *target)
+	case "dns-burst":
+		err = dnsBurst(ctx, *listen, *target, 64)
 	case "live-probe":
 		err = liveProbe(ctx, *directory)
 	case "stun-vector":
@@ -82,6 +84,31 @@ func main() {
 	if err != nil && ctx.Err() == nil {
 		log.Fatal(err)
 	}
+}
+
+func dnsBurst(ctx context.Context, dnsAddress, name string, count int) error {
+	if _, err := netip.ParseAddrPort(dnsAddress); err != nil || count < 1 || count > 128 || name == "" || len(name) > 253 {
+		return errors.New("DNS burst requires a numeric endpoint, domain and bounded count")
+	}
+	burst, cancel := context.WithTimeout(ctx, 20*time.Second)
+	defer cancel()
+	resolver := &net.Resolver{PreferGo: true, StrictErrors: true, Dial: func(ctx context.Context, network, _ string) (net.Conn, error) {
+		return (&net.Dialer{Timeout: 2 * time.Second}).DialContext(ctx, network, dnsAddress)
+	}}
+	started := time.Now()
+	for attempt := 0; attempt < count; attempt++ {
+		lookup, stop := context.WithTimeout(burst, 2*time.Second)
+		addresses, err := resolver.LookupIPAddr(lookup, name)
+		stop()
+		if err != nil {
+			return fmt.Errorf("DNS burst lookup %d/%d failed: %w", attempt+1, count, err)
+		}
+		if len(addresses) == 0 {
+			return fmt.Errorf("DNS burst lookup %d/%d returned no addresses", attempt+1, count)
+		}
+	}
+	fmt.Printf("PASS DNS burst lookups=%d elapsed_ms=%d\n", count, time.Since(started).Milliseconds())
+	return nil
 }
 
 func webProbe(ctx context.Context, dnsAddress, resolvedIPv4 string) error {
