@@ -253,7 +253,16 @@ impl DnsPlan {
             }
             // 官方 Android 出口的 peerapi 使用宿主解析器，不把平台公共 DNS 当作手机系统 DNS。
             // 显式指定的加密解析器或 DNSSEC 仍走用户配置，不能因出口查询绕过这些安全设置。
-            if config.dns_resolvers.is_empty() && !config.dnssec_validate && !fallback.is_empty() {
+            let encrypted = plan
+                .defaults
+                .iter()
+                .chain(plan.routes.values().flatten())
+                .any(|target| matches!(target, Target::Encrypted { .. }));
+            if config.dns_resolvers.is_empty()
+                && !config.dnssec_validate
+                && !encrypted
+                && !fallback.is_empty()
+            {
                 plan.peer_defaults = Some(fallback.iter().copied().map(Target::Dns).collect());
             }
         }
@@ -313,6 +322,13 @@ impl DnsPlan {
     }
 
     pub fn answer_for_peer(&self, query: &Message) -> Answer {
+        if self
+            .routes
+            .keys()
+            .any(|suffix| suffix.zone_of(query.queries[0].name()))
+        {
+            return self.answer(query);
+        }
         match (self.answer(query), &self.peer_defaults) {
             // MagicDNS 和权威 NXDOMAIN 仍在本地回答，不能向运营商泄露网络内设备名。
             (Answer::Forward(_), Some(targets)) => Answer::Forward(targets.clone()),
@@ -654,6 +670,11 @@ mod tests {
         };
         assert_eq!(normal[0].address(), "9.9.9.9:53".parse().unwrap());
         assert_eq!(peer[0].address(), fallback[0]);
+        let Answer::Forward(split) = plan.answer_for_peer(&ask("nas.office.test", RecordType::A))
+        else {
+            panic!("split DNS");
+        };
+        assert_eq!(split[0].address(), "10.77.0.1:5353".parse().unwrap());
         for name in [
             "nas.mesh.test",
             "missing.mesh.test",
@@ -696,5 +717,17 @@ mod tests {
                 assert!(peer.is_empty());
             }
         }
+        let mut encrypted_map = map();
+        encrypted_map.dns.resolvers = vec![DnsResolver {
+            addr: "https://192.0.2.54/dns-query".into(),
+            ..DnsResolver::default()
+        }];
+        let plan = DnsPlan::new(&config, &encrypted_map, &[], &fallback)
+            .unwrap()
+            .unwrap();
+        let Answer::Forward(peer) = plan.answer_for_peer(&question) else {
+            panic!("encrypted network DNS");
+        };
+        assert!(matches!(peer[0], Target::Encrypted { .. }));
     }
 }
