@@ -27,3 +27,11 @@ func TestWebProbeRequiresNumericDNSEndpoint(test *testing.T) {
 		})
 	}
 }
+
+func TestUDPErrorProbeRejectsNonPrivateOrInvalidTargets(test *testing.T) {
+	for _, target := range []string{"", "example.com:53", "1.1.1.1:53", "127.0.0.1:53", "10.0.0.1:0"} {
+		if err := udpErrorProbe(context.Background(), target); err == nil || !strings.Contains(err.Error(), "private numeric") {
+			test.Fatalf("invalid UDP error probe target was not rejected")
+		}
+	}
+}

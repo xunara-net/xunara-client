@@ -8,6 +8,8 @@ use anyhow::{Result, ensure};
 use ipnet::IpNet;
 use serde_json::Value;
 
+mod icmp;
+
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
 pub struct Packet {
     pub source: IpAddr,
@@ -251,6 +253,11 @@ impl Filter {
         self.responses
             .get(&packet)
             .is_some_and(|expiry| *expiry > Instant::now())
+    }
+
+    pub fn related_error(&self, bytes: &[u8]) -> bool {
+        // 不像上游直接放行所有 ICMP 错误：只接收引用本机尚有效出站连接的控制报文。
+        icmp::quoted_packet(bytes).is_some_and(|packet| self.established(packet.reversed()))
     }
 }
 

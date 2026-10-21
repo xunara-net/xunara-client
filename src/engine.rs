@@ -181,6 +181,8 @@ struct ReceiveStats {
     source_drops: u64,
     destination_drops: u64,
     acl_drops: u64,
+    related_icmp: u64,
+    untracked_exit_drops: u64,
 }
 
 pub struct Engine {
@@ -829,7 +831,7 @@ impl Engine {
                     self.receive_stats.destination_drops += 1;
                     return Ok(());
                 }
-                let allowed = if self.peers[&identity]
+                let peer_source = self.peers[&identity]
                     .node
                     .addresses
                     .iter()
@@ -840,8 +842,9 @@ impl Engine {
                             .iter()
                             .filter(|prefix| prefix.prefix_len() > 0),
                     )
-                    .any(|prefix| prefix.contains(&packet.source))
-                {
+                    .any(|prefix| prefix.contains(&packet.source));
+                let related_error = self.filter.related_error(&bytes);
+                let allowed = if peer_source {
                     if self
                         .forwarding
                         .as_ref()
@@ -862,12 +865,15 @@ impl Engine {
                             ..packet
                         })
                     } else {
-                        self.filter.incoming(packet)
+                        self.filter.incoming(packet) || related_error
                     }
                 } else {
-                    self.filter.established(packet)
+                    self.filter.established(packet) || related_error
                 };
                 if allowed {
+                    if related_error {
+                        self.receive_stats.related_icmp += 1;
+                    }
                     let (path, region) = match path {
                         Path::Udp(_) => ("direct", 0),
                         Path::Derp(region) => ("relay", region),
@@ -886,6 +892,9 @@ impl Engine {
                     self.received_bytes += bytes.len() as u64;
                 } else {
                     self.receive_stats.acl_drops += 1;
+                    if !peer_source {
+                        self.receive_stats.untracked_exit_drops += 1;
+                    }
                 }
             }
             _ => {}
@@ -1105,10 +1114,12 @@ impl Engine {
             "forwarding":{"requested":self.config.advertised_routes(),"active":self.fresh() && self.forwarding.is_some(),"approved":self.forwarding.as_ref().map(|router|&router.plan().routes),"flows":self.forwarding.as_ref().map_or(0,Forwarder::flows)},
             "self_name":self.map.node.as_ref().map(|node| &node.name),"key_expiry":self.map.node.as_ref().and_then(|node| node.key_expiry.as_ref()),
             "owner_login":self.map.node.as_ref().and_then(|node|self.map.user_profiles.get(&node.user)).map(|profile|&profile.login_name),
-            "dns":{"enabled":self.map.dns.proxied,"domains":self.map.dns.domains,"active":self.fresh() && self.dns.is_some() && (self.config.accept_dns || !self.config.exit_node_id.is_empty()),"address":self.dns.as_ref().map(|dns|dns.plan().address),"dnssec_validate":self.fresh() && self.dns.as_ref().is_some_and(|dns|dns.plan().dnssec_validate) && (self.config.accept_dns || !self.config.exit_node_id.is_empty())},
-            "exit_node":{"selected_id":self.config.exit_node_id,"available":self.fresh() && !self.config.exit_node_id.is_empty() && self.peers.values().any(|peer|peer.node.stable_id==self.config.exit_node_id && peer.node.exit_node())},
+            "dns":{"enabled":self.map.dns.proxied,"domains":self.map.dns.domains,"active":self.fresh() && self.dns.is_some() && (self.config.accept_dns || !self.config.exit_node_id.is_empty()),"address":self.dns.as_ref().map(|dns|dns.plan().address),"dnssec_validate":self.fresh() && self.dns.as_ref().is_some_and(|dns|dns.plan().dnssec_validate) && (self.config.accept_dns || !self.config.exit_node_id.is_empty()),"statistics":self.dns.as_ref().map(DnsProxy::statistics)},
+            "exit_node":{"selected_id":self.config.exit_node_id,"available":self.fresh() && !self.config.exit_node_id.is_empty() && self.peers.values().any(|peer|peer.node.stable_id==self.config.exit_node_id && peer.node.exit_node()),
+                "online":self.peers.values().find(|peer|peer.node.stable_id==self.config.exit_node_id).and_then(|peer|self.fresh().then_some(peer.node.online).flatten())},
             "devices":self.peers.values().map(|peer| json!({"id":peer.node.id.to_string(),"name":peer.node.name,"addresses":peer.node.addresses,
                 "os":peer.node.hostinfo.as_ref().map(|hostinfo| &hostinfo.os),"key_expiry":peer.node.key_expiry,"stable_id":peer.node.stable_id,"exit_node":peer.node.exit_node(),
+                "online":self.fresh().then_some(peer.node.online).flatten(),"last_seen":peer.node.last_seen,
                 "routes":peer.node.allowed_ips.iter().filter(|prefix| prefix.prefix_len()>0 && prefix.prefix_len() < if prefix.addr().is_ipv4(){32}else{128}).collect::<Vec<_>>(),
                 "authorized":peer.node.valid(),"path":if peer.direct_address(now).is_some(){"direct"}else{"relay"},
                 "relay_name":self.map.derp.regions.get(&peer.node.relay_region()).map(|region| if region.region_name.is_empty(){&region.region_code}else{&region.region_name}),

@@ -34,7 +34,7 @@ import (
 )
 
 func main() {
-	mode := flag.String("mode", "fixture", "fixture | proxy | http | official | exit | phone | dns | web-probe | live-probe | stun-vector | masq-vector")
+	mode := flag.String("mode", "fixture", "fixture | proxy | http | official | exit | phone | dns | udp-error | web-probe | live-probe | stun-vector | masq-vector")
 	directory := flag.String("dir", "", "private test directory")
 	listen := flag.String("listen", "127.0.0.1:18080", "test listen address")
 	target := flag.String("target", "", "test proxy/HTTP target")
@@ -59,6 +59,8 @@ func main() {
 		err = officialPhoneProbe(ctx, *directory)
 	case "dns":
 		err = dnsFixture(ctx, *listen)
+	case "udp-error":
+		err = udpErrorProbe(ctx, *target)
 	case "web-probe":
 		err = webProbe(ctx, *listen, *target)
 	case "live-probe":

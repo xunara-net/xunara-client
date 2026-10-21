@@ -29,6 +29,15 @@ const LIMIT: usize = 64;
 const TCP_LIMIT: usize = 8;
 const MAX_RESPONSE: usize = 65535;
 
+#[derive(Default, serde::Serialize)]
+pub struct Statistics {
+    queries: u64,
+    responses: u64,
+    servfail: u64,
+    nxdomain: u64,
+    timeouts: u64,
+}
+
 enum Client {
     Udp(IpEndpoint, usize),
     Tcp(usize, u64),
@@ -77,6 +86,7 @@ pub struct DnsProxy {
     validation_requests: mpsc::Receiver<crate::dns_validate::Request>,
     api_sender: mpsc::Sender<ApiRequest>,
     api_requests: mpsc::Receiver<ApiRequest>,
+    statistics: Statistics,
 }
 
 pub struct ApiRequest {
@@ -168,11 +178,16 @@ impl DnsProxy {
             validation_requests,
             api_sender,
             api_requests,
+            statistics: Statistics::default(),
         })
     }
 
     pub fn plan(&self) -> &DnsPlan {
         &self.plan
+    }
+
+    pub fn statistics(&self) -> &Statistics {
+        &self.statistics
     }
 
     pub fn api_sender(&self) -> mpsc::Sender<ApiRequest> {
@@ -223,8 +238,12 @@ impl DnsProxy {
             if let Some(pending) = self.pending.get_mut(&id) {
                 pending.direct = false;
             }
-            if let Ok(response) = response {
-                self.complete(id, response);
+            match response {
+                Ok(response) => self.complete(id, response),
+                Err(error) if error.is::<tokio::time::error::Elapsed>() => {
+                    self.statistics.timeouts += 1;
+                }
+                Err(_) => {}
             }
         }
         let mut requests = Vec::new();
@@ -374,8 +393,22 @@ impl DnsProxy {
                     },
                     Err(_) => failed.push(*id),
                     Ok(None) => {
-                        if upstream.started.elapsed() > Duration::from_secs(4) || !socket.is_open()
-                        {
+                        // 官方 peerapi 自身允许五秒解析，不能在连接成功后仍用四秒总预算提前撤销。
+                        // 建连仍有短超时；已连接出口沿用官方 DNS 的十秒上限，不回退手机原网络。
+                        let budget = if matches!(upstream.target, Target::PeerHttp(_))
+                            && !matches!(
+                                socket.state(),
+                                tcp::State::SynSent | tcp::State::SynReceived
+                            ) {
+                            Duration::from_secs(10)
+                        } else {
+                            Duration::from_secs(4)
+                        };
+                        let timed_out = upstream.started.elapsed() > budget;
+                        if timed_out || !socket.is_open() {
+                            if timed_out {
+                                self.statistics.timeouts += 1;
+                            }
                             failed.push(*id);
                         }
                     }
@@ -403,6 +436,9 @@ impl DnsProxy {
     }
 
     fn request(&mut self, client: Client, query: Message) {
+        if matches!(&client, Client::Udp(..) | Client::Tcp(..)) {
+            self.statistics.queries += 1;
+        }
         match self.plan.answer(&query) {
             Answer::Local(response) => self.respond(client, &response),
             Answer::Forward(targets) => {
@@ -524,6 +560,15 @@ impl DnsProxy {
         }
     }
     fn respond(&mut self, client: Client, response: &Message) {
+        // 只统计应用 DNS 消息，不把 TCP ACK、校验器递归或 peerapi 内部请求当成手机查询。
+        if matches!(&client, Client::Udp(..) | Client::Tcp(..)) {
+            self.statistics.responses += 1;
+            match response.metadata.response_code {
+                ResponseCode::ServFail => self.statistics.servfail += 1,
+                ResponseCode::NXDomain => self.statistics.nxdomain += 1,
+                _ => {}
+            }
+        }
         match client {
             Client::Validation(reply) | Client::Api(reply) => {
                 let _ = reply.send(response.clone());
@@ -893,6 +938,141 @@ mod tests {
             .unwrap(),
         )
         .unwrap()
+    }
+
+    #[test]
+    fn connected_exit_dns_can_finish_after_four_seconds_without_premature_failover() {
+        let mut server = proxy();
+        let mut query = Message::query();
+        query.queries.push(Query::query(
+            Name::from_ascii("external.public.test.").unwrap(),
+            RecordType::A,
+        ));
+        let (sender, mut response) = oneshot::channel();
+        server.request(Client::Api(sender), query.clone());
+        let identity = server.next_id;
+        server
+            .pending
+            .get_mut(&identity)
+            .unwrap()
+            .targets
+            .push_back(Target::PeerHttp("100.80.0.2:1".parse().unwrap()));
+        server.forward(identity);
+        let mut device = Queue::default();
+        let mut interface = Interface::new(
+            Config::new(HardwareAddress::Ip),
+            &mut device,
+            StackInstant::from_millis(0),
+        );
+        interface.update_ip_addrs(|addresses| {
+            addresses
+                .push(IpCidr::new("100.80.0.2".parse().unwrap(), 32))
+                .unwrap()
+        });
+        interface
+            .routes_mut()
+            .add_default_ipv4_route("100.100.100.100".parse().unwrap())
+            .unwrap();
+        let mut sockets = SocketSet::new(Vec::new());
+        let mut socket = tcp_socket();
+        socket
+            .listen(("100.80.0.2".parse::<IpAddress>().unwrap(), 1))
+            .unwrap();
+        let handle = sockets.add(socket);
+        let mut received_request = false;
+        for tick in 0..200 {
+            for bytes in server.poll() {
+                device.input.push_back(bytes);
+            }
+            interface.poll(StackInstant::from_millis(tick), &mut device, &mut sockets);
+            for bytes in device.output.drain(..) {
+                server.ingest(&bytes);
+            }
+            if sockets.get::<tcp::Socket>(handle).can_recv() {
+                received_request = true;
+                break;
+            }
+        }
+        assert!(
+            received_request,
+            "peerapi must complete a real TCP handshake and receive the HTTP request"
+        );
+        server
+            .pending
+            .get_mut(&identity)
+            .unwrap()
+            .upstream
+            .as_mut()
+            .unwrap()
+            .started = Instant::now() - Duration::from_millis(4500);
+        for bytes in server.poll() {
+            device.input.push_back(bytes);
+        }
+        assert!(
+            server.pending.contains_key(&identity),
+            "a connected official peerapi can legitimately take more than four seconds to answer"
+        );
+        let answer = dns::reply(&query, ResponseCode::NoError).to_vec().unwrap();
+        let mut http = format!("HTTP/1.0 200 OK\r\nContent-Type: application/dns-message\r\nContent-Length: {}\r\n\r\n", answer.len()).into_bytes();
+        http.extend(answer);
+        sockets
+            .get_mut::<tcp::Socket>(handle)
+            .send_slice(&http)
+            .unwrap();
+        for tick in 200..400 {
+            interface.poll(StackInstant::from_millis(tick), &mut device, &mut sockets);
+            for bytes in device.output.drain(..) {
+                server.ingest(&bytes);
+            }
+            for bytes in server.poll() {
+                device.input.push_back(bytes);
+            }
+            if let Ok(response) = response.try_recv() {
+                assert_eq!(response.metadata.response_code, ResponseCode::NoError);
+                return;
+            }
+        }
+        panic!("the valid delayed peerapi response was not delivered");
+    }
+
+    #[test]
+    fn statistics_separate_queries_responses_timeouts_and_internal_requests() {
+        let mut server = proxy();
+        let client = || Client::Udp(IpEndpoint::new("100.80.0.1".parse().unwrap(), 53000), 512);
+        let question = |name| {
+            let mut query = Message::query();
+            query
+                .queries
+                .push(Query::query(Name::from_ascii(name).unwrap(), RecordType::A));
+            query
+        };
+        server.request(client(), question("nas.mesh.test."));
+        server.request(client(), question("missing.mesh.test."));
+        let (reply, _) = oneshot::channel();
+        server.request(Client::Api(reply), question("nas.mesh.test."));
+        server.request(client(), question("external.public.test."));
+        let identity = server.next_id;
+        server
+            .pending
+            .get_mut(&identity)
+            .unwrap()
+            .targets
+            .push_back(Target::PeerHttp("100.80.0.2:1".parse().unwrap()));
+        server.forward(identity);
+        server
+            .pending
+            .get_mut(&identity)
+            .unwrap()
+            .upstream
+            .as_mut()
+            .unwrap()
+            .started = Instant::now() - Duration::from_secs(5);
+        server.poll();
+        let statistics = serde_json::to_value(server.statistics()).unwrap();
+        assert_eq!(
+            statistics,
+            json!({"queries":3,"responses":3,"servfail":1,"nxdomain":1,"timeouts":1})
+        );
     }
 
     #[test]

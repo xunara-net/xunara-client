@@ -100,6 +100,10 @@ until [ "$(fetch http://192.168.90.2:8088 2>/dev/null || :)" = xunara-core-ok ];
     attempt=$((attempt+1)); [ "$attempt" -lt 30 ] || exit 1; sleep 1
 done
 printf 'PASS approved subnet forwarding to independent LAN namespace\n'
+nsenter -t "$client" -n "$fixture" -mode udp-error -target 192.168.90.2:5353 >"$directory/related-icmp.log" 2>&1 || {
+    echo 'Related ICMP was dropped: a permitted UDP flow must receive the independent LAN port-unreachable' >&2; exit 1;
+}
+printf 'PASS related ICMP error without granting unsolicited LAN ICMP\n'
 if [ "$snat" = true ]; then printf 'PASS subnet SNAT without a LAN return route\n'; fi
 "$fixture" -mode official -dir "$directory" -target "$router_ip" >"$directory/official.log" 2>&1 & pids="$pids $!"
 attempt=0

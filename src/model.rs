@@ -30,6 +30,8 @@ pub struct Node {
     pub legacy_derp: String,
     pub key_expiry: Option<String>,
     pub expired: bool,
+    pub online: Option<bool>,
+    pub last_seen: Option<String>,
     pub is_jailed: bool,
     pub machine_authorized: bool,
     pub hostinfo: Option<Hostinfo>,
@@ -284,6 +286,41 @@ impl NetworkMap {
                 }
             }
         }
+        // Online 是控制面连接状态，不代表业务可达；缺失沿用，未知不能伪装成离线。
+        if let Some(changes) = update.get("OnlineChange").and_then(Value::as_object) {
+            for (identity, online) in changes {
+                if online.is_boolean()
+                    && let Some(peer) = identity
+                        .parse::<u64>()
+                        .ok()
+                        .and_then(|identity| self.peers.get_mut(&identity))
+                        .and_then(Value::as_object_mut)
+                {
+                    peer.insert("Online".into(), online.clone());
+                }
+            }
+        }
+        if let Some(changes) = update.get("PeerSeenChange").and_then(Value::as_object) {
+            for (identity, seen) in changes {
+                if let Some(seen) = seen.as_bool()
+                    && let Some(peer) = identity
+                        .parse::<u64>()
+                        .ok()
+                        .and_then(|identity| self.peers.get_mut(&identity))
+                        .and_then(Value::as_object_mut)
+                {
+                    let last_seen = if seen {
+                        Value::String(
+                            time::OffsetDateTime::now_utc()
+                                .format(&time::format_description::well_known::Rfc3339)?,
+                        )
+                    } else {
+                        Value::Null
+                    };
+                    peer.insert("LastSeen".into(), last_seen);
+                }
+            }
+        }
         if let Some(patches) = update.get("PeersChangedPatch").and_then(Value::as_array) {
             for patch in patches {
                 if let Some(peer) = patch
@@ -388,6 +425,26 @@ mod tests {
     use serde_json::json;
 
     #[test]
+    fn presence_deltas_preserve_unknown_and_do_not_resurrect_removed_peers() {
+        let mut map = NetworkMap::default();
+        map.apply(json!({"Peers":[{"ID":1,"Key":"key","Online":true,"LastSeen":"2026-10-20T00:00:00Z"},{"ID":2,"Key":"other"}]})).unwrap();
+        map.apply(json!({"OnlineChange":{"1":false,"3":true},"PeerSeenChange":{"1":true}}))
+            .unwrap();
+        assert_eq!(map.peers[&1]["Online"], false);
+        assert_ne!(map.peers[&1]["LastSeen"], "2026-10-20T00:00:00Z");
+        assert!(map.peers[&2].get("Online").is_none());
+        assert!(!map.peers.contains_key(&3));
+        map.apply(json!({"OnlineChange":{"1":true},"PeerSeenChange":{"1":false},"PeersChangedPatch":[{"NodeID":1,"Online":false}]})).unwrap();
+        assert_eq!(map.peers[&1]["Online"], false);
+        assert!(map.peers[&1]["LastSeen"].is_null());
+        map.apply(
+            json!({"PeersRemoved":[1],"OnlineChange":{"1":true},"PeerSeenChange":{"1":true}}),
+        )
+        .unwrap();
+        assert!(!map.peers.contains_key(&1));
+    }
+
+    #[test]
     fn derp_patch_updates_node_field_and_zero_does_not_clear_home() {
         let mut map = NetworkMap::default();
         map.apply(json!({"Peers":[{"ID":1,"Key":"key","HomeDERP":0,"MachineAuthorized":false}]}))
@@ -465,6 +522,8 @@ fn source_policy_changes_on_identity_routes_and_masquerade_but_not_display_or_tr
     let mut changed = original.clone();
     changed.name = "renamed.core.test.".into();
     changed.home_derp = 900;
+    changed.online = Some(false);
+    changed.last_seen = Some("2026-10-21T01:00:00Z".into());
     changed.endpoints = vec!["192.0.2.1:41641".parse().unwrap()];
     assert_eq!(original.source_policy(), changed.source_policy());
     changed.key = "nodekey:another-machine".into();
