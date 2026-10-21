@@ -31,3 +31,4 @@ MagicDNS 和权威 NXDOMAIN 在本地终止。用户显式配置的 DoH / DoT / 
 - Rust fmt、clippy、64 项普通单测、两项显式执行的官方 STUN / 共享地址兼容向量通过。
 - Go 隔离夹具 build、vet、test、race 通过；不可达 DNS 开关只影响已隔离的双安卓场景，不改变普通网络夹具。
 - 实际 Android VPN 与发布包验收记录由 Android 仓库保存；本记录不将本机单测冒充真机验收。
+- 最终 `607d7bc` 内核在 Android 36 x86_64 的实际 Release 上完成双玄序出口 / 官方 Android 消费端的公网 DNS 和验证证书的 HTTPS；旧版 IP 成功而 DNS 超时的对照、完整隔离回归及加密 DNS 扩展未通过的边界见 [Android 记录](https://github.com/xunara-net/xunara-android/blob/main/docs/magicdns-fix.md)。
