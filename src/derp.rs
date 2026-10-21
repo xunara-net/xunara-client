@@ -22,10 +22,23 @@ use crate::{
     transport,
 };
 
-pub struct Received {
-    pub region: u16,
-    pub peer: [u8; 32],
-    pub bytes: Vec<u8>,
+pub enum Received {
+    Packet {
+        region: u16,
+        connection: u64,
+        peer: [u8; 32],
+        bytes: Vec<u8>,
+    },
+    PeerGone {
+        region: u16,
+        connection: u64,
+        peer: [u8; 32],
+    },
+}
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct ReverseRoute {
+    region: u16,
+    connection: u64,
 }
 struct Outbound {
     peer: [u8; 32],
@@ -35,9 +48,14 @@ struct Worker {
     definition: Vec<DerpNode>,
     sender: mpsc::Sender<Outbound>,
     health: watch::Receiver<Option<Duration>>,
+    connection: watch::Receiver<Option<u64>>,
     preferred: watch::Sender<bool>,
     started: Instant,
     task: JoinHandle<()>,
+}
+struct SessionSignals {
+    health: watch::Sender<Option<Duration>>,
+    connection: watch::Sender<Option<u64>>,
 }
 
 #[derive(Default)]
@@ -67,6 +85,7 @@ pub struct Hub {
     workers: BTreeMap<u16, Worker>,
     attempted: BTreeMap<u16, Instant>,
     home: u16,
+    reverse_routes: BTreeMap<[u8; 32], ReverseRoute>,
 }
 
 impl Hub {
@@ -143,6 +162,14 @@ impl Hub {
             wanted.insert(self.home);
         }
         ensure!(wanted.len() <= 32, "需要连接的 DERP 区域超过首版上限");
+        let reverse_regions = self
+            .reverse_routes
+            .values()
+            .filter(|route| self.reverse_worker(**route).is_some())
+            .map(|route| route.region)
+            .filter(|region| !wanted.contains(region))
+            .collect::<BTreeSet<_>>();
+        wanted.extend(reverse_regions.into_iter().take(32 - wanted.len()));
         if self.home == 0 {
             // 无 home 时最多并行四条候选连接，轮换失败区域；不能永久困在最小编号上。
             let mut candidates = definitions
@@ -180,6 +207,7 @@ impl Hub {
             let definition = nodes.clone();
             let (sender, receiver) = mpsc::channel(128);
             let (health_sender, health) = watch::channel(None);
+            let (connection_sender, connection) = watch::channel(None);
             let (preferred, preference) = watch::channel(region == self.home);
             let incoming = incoming.clone();
             let task = tokio::spawn(async move {
@@ -189,7 +217,10 @@ impl Hub {
                     private,
                     receiver,
                     incoming,
-                    health_sender,
+                    SessionSignals {
+                        health: health_sender,
+                        connection: connection_sender,
+                    },
                     preference,
                 )
                 .await;
@@ -202,6 +233,7 @@ impl Hub {
                     definition,
                     sender,
                     health,
+                    connection,
                     preferred,
                     started,
                     task,
@@ -213,13 +245,48 @@ impl Hub {
 
     pub fn send(&self, region: u16, peer: [u8; 32], bytes: &[u8]) {
         if bytes.len() <= 65536
-            && let Some(worker) = self.workers.get(&region)
+            && let Some(worker) = self
+                .workers
+                .get(&region)
+                .filter(|worker| worker.connection.borrow().is_some() && !worker.task.is_finished())
+                .or_else(|| {
+                    self.reverse_routes
+                        .get(&peer)
+                        .and_then(|route| self.reverse_worker(*route))
+                })
+                .or_else(|| self.workers.get(&region))
         {
             let _ = worker.sender.try_send(Outbound {
                 peer,
                 bytes: bytes.to_vec(),
             });
         }
+    }
+
+    fn reverse_worker(&self, route: ReverseRoute) -> Option<&Worker> {
+        self.workers.get(&route.region).filter(|worker| {
+            *worker.connection.borrow() == Some(route.connection) && !worker.task.is_finished()
+        })
+    }
+
+    pub fn remember_authenticated(&mut self, peer: [u8; 32], region: u16, connection: u64) {
+        let route = ReverseRoute { region, connection };
+        // 只能由已通过 WireGuard 验证的已知 peer 调用；连接代次防止重连后沿用旧回程。
+        if self.reverse_worker(route).is_some()
+            && (self.reverse_routes.len() < 256 || self.reverse_routes.contains_key(&peer))
+        {
+            self.reverse_routes.insert(peer, route);
+        }
+    }
+
+    pub fn forget_route(&mut self, peer: [u8; 32], region: u16, connection: u64) {
+        if self.reverse_routes.get(&peer) == Some(&ReverseRoute { region, connection }) {
+            self.reverse_routes.remove(&peer);
+        }
+    }
+
+    pub fn retain_peer_routes(&mut self, peers: &[[u8; 32]]) {
+        self.reverse_routes.retain(|peer, _| peers.contains(peer));
     }
 }
 
@@ -237,7 +304,7 @@ async fn reconnect(
     private: [u8; 32],
     mut outgoing: mpsc::Receiver<Outbound>,
     incoming: mpsc::Sender<Received>,
-    health: watch::Sender<Option<Duration>>,
+    signals: SessionSignals,
     mut preferred: watch::Receiver<bool>,
 ) {
     let mut attempt = 0;
@@ -249,11 +316,12 @@ async fn reconnect(
             private,
             &mut outgoing,
             &incoming,
-            &health,
+            &signals,
             &mut preferred,
         )
         .await;
-        health.send_replace(None);
+        signals.health.send_replace(None);
+        signals.connection.send_replace(None);
         if result.is_ok() || outgoing.is_closed() {
             return;
         }
@@ -269,7 +337,7 @@ async fn session(
     private: [u8; 32],
     outgoing: &mut mpsc::Receiver<Outbound>,
     incoming: &mpsc::Sender<Received>,
-    health: &watch::Sender<Option<Duration>>,
+    signals: &SessionSignals,
     preferred: &mut watch::Receiver<bool>,
 ) -> Result<()> {
     let port = if node.derp_port == 0 {
@@ -321,6 +389,8 @@ async fn session(
         .decrypt(information[..24].into(), &information[24..])
         .map_err(|_| anyhow::anyhow!("DERP 服务端身份校验失败"))?;
     let _: serde_json::Value = serde_json::from_slice(&clear)?;
+    let connection = OsRng.next_u64();
+    signals.connection.send_replace(Some(connection));
     let preference = *preferred.borrow_and_update();
     write_frame(&mut stream, 7, &[u8::from(preference)]).await?;
     let (mut reader, mut writer) = tokio::io::split(stream);
@@ -333,10 +403,24 @@ async fn session(
                 5 if payload.len() >= 32 => {
                     let peer = payload[..32].try_into()?;
                     if incoming
-                        .send(Received {
+                        .send(Received::Packet {
                             region,
+                            connection,
                             peer,
                             bytes: payload[32..].to_vec(),
+                        })
+                        .await
+                        .is_err()
+                    {
+                        return Ok::<(), anyhow::Error>(());
+                    }
+                }
+                0x08 if payload.len() >= 32 => {
+                    if incoming
+                        .send(Received::PeerGone {
+                            region,
+                            connection,
+                            peer: payload[..32].try_into()?,
                         })
                         .await
                         .is_err()
@@ -364,7 +448,7 @@ async fn session(
                 if kind == 0x12 {
                     write_frame(&mut writer,0x13,&payload).await?;
                 } else if let Some(rtt) = heartbeat.pong(&payload) {
-                    health.send_replace(Some(rtt));
+                    signals.health.send_replace(Some(rtt));
                 }
             }
             changed = preferred.changed() => {

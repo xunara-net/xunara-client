@@ -144,3 +144,76 @@ async fn bounded_home_search_rotates_past_unreachable_initial_regions() {
     assert_eq!(hub.home_region(), 900);
     assert_eq!(hub.workers.len(), 1);
 }
+
+fn connected_worker(
+    connection: Option<u64>,
+) -> (Worker, mpsc::Receiver<Outbound>, watch::Sender<Option<u64>>) {
+    let (sender, receiver) = mpsc::channel(4);
+    let (_, health) = watch::channel(None);
+    let (connection_sender, connection) = watch::channel(connection);
+    let (preferred, _) = watch::channel(false);
+    (
+        Worker {
+            definition: Vec::new(),
+            sender,
+            health,
+            connection,
+            preferred,
+            started: Instant::now(),
+            task: tokio::spawn(std::future::pending()),
+        },
+        receiver,
+        connection_sender,
+    )
+}
+
+#[tokio::test]
+async fn authenticated_reverse_route_handles_unknown_home_and_preserves_known_live_home() {
+    let mut hub = Hub::default();
+    let (worker, mut reverse, _connection) = connected_worker(Some(9));
+    hub.workers.insert(900, worker);
+    let (worker, mut advertised, _connection) = connected_worker(Some(1));
+    hub.workers.insert(1, worker);
+    let peer = [3; 32];
+    hub.send(0, peer, b"missing");
+    assert!(reverse.try_recv().is_err());
+    hub.remember_authenticated(peer, 900, 9);
+    hub.send(0, peer, b"reply");
+    let packet = reverse.try_recv().unwrap();
+    assert_eq!(packet.peer, peer);
+    assert_eq!(packet.bytes, b"reply");
+    hub.send(1, peer, b"preferred");
+    assert_eq!(advertised.try_recv().unwrap().bytes, b"preferred");
+    hub.send(0, [4; 32], b"other peer");
+    assert!(reverse.try_recv().is_err());
+    assert_eq!(hub.home_region(), 0);
+}
+
+#[tokio::test]
+async fn reverse_route_cannot_cross_connection_restarts_peer_gone_or_removed_identities() {
+    let mut hub = Hub::default();
+    let (worker, mut reverse, connection) = connected_worker(Some(9));
+    hub.workers.insert(900, worker);
+    let peer = [3; 32];
+    hub.remember_authenticated(peer, 900, 8);
+    assert!(hub.reverse_routes.is_empty());
+    hub.remember_authenticated(peer, 900, 9);
+    connection.send_replace(Some(10));
+    hub.send(0, peer, b"stale");
+    assert!(reverse.try_recv().is_err());
+    hub.remember_authenticated(peer, 900, 10);
+    hub.forget_route(peer, 900, 9);
+    hub.send(0, peer, b"new connection");
+    assert_eq!(reverse.try_recv().unwrap().bytes, b"new connection");
+    hub.forget_route(peer, 900, 10);
+    hub.send(0, peer, b"gone");
+    assert!(reverse.try_recv().is_err());
+    hub.remember_authenticated(peer, 900, 10);
+    hub.retain_peer_routes(&[]);
+    hub.send(0, peer, b"removed");
+    assert!(reverse.try_recv().is_err());
+    hub.remember_authenticated(peer, 900, 10);
+    connection.send_replace(None);
+    hub.send(0, peer, b"disconnected");
+    assert!(reverse.try_recv().is_err());
+}

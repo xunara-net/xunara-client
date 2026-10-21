@@ -34,7 +34,7 @@ use crate::{
 #[derive(Clone, Copy)]
 enum Path {
     Udp(SocketAddr),
-    Derp(u16),
+    Derp(u16, u64),
 }
 enum Output {
     Wire(Vec<u8>),
@@ -319,13 +319,21 @@ impl Engine {
                     let length = length?;
                     self.outgoing(&packet[..length]).await?;
                 }
-                Event::Derp(Some(received)) => {
-                    self.receive(
-                        Some(received.peer),
-                        Path::Derp(received.region),
-                        &received.bytes,
-                    )
-                    .await?
+                Event::Derp(Some(Received::Packet {
+                    region,
+                    connection,
+                    peer,
+                    bytes,
+                })) => {
+                    self.receive(Some(peer), Path::Derp(region, connection), &bytes)
+                        .await?
+                }
+                Event::Derp(Some(Received::PeerGone {
+                    region,
+                    connection,
+                    peer,
+                })) => {
+                    self.hub.forget_route(peer, region, connection);
                 }
                 Event::Derp(None) => anyhow::bail!("中继输入已停止"),
                 Event::Ping(Some(request)) => self.ping(request).await?,
@@ -476,6 +484,7 @@ impl Engine {
         }
         self.map = map;
         self.last_map = Some(Instant::now());
+        self.hub.retain_peer_routes(&keys);
         self.update_relays()?;
         Ok(())
     }
@@ -663,7 +672,7 @@ impl Engine {
                         self.hub.send(peer.node.relay_region(), peer.key, bytes);
                     }
                 }
-                Path::Derp(region) => self.hub.send(region, peer.key, bytes),
+                Path::Derp(region, _) => self.hub.send(region, peer.key, bytes),
             }
             return;
         }
@@ -741,7 +750,7 @@ impl Engine {
         for identity in candidates {
             let source = match path {
                 Path::Udp(address) => Some(address.ip()),
-                Path::Derp(_) => None,
+                Path::Derp(_, _) => None,
             };
             let result = self
                 .peers
@@ -762,11 +771,19 @@ impl Engine {
                 Output::Wire(bytes) => matches!(bytes.first(), Some(2 | 4)),
                 Output::Invalid => false,
             };
-            if authenticated && let Path::Udp(address) = path {
-                self.peers
-                    .get_mut(&identity)
-                    .context("peer 丢失")?
-                    .authenticated_udp(address, Instant::now());
+            if authenticated {
+                match path {
+                    Path::Udp(address) => self
+                        .peers
+                        .get_mut(&identity)
+                        .context("peer 丢失")?
+                        .authenticated_udp(address, Instant::now()),
+                    Path::Derp(region, connection) => self.hub.remember_authenticated(
+                        self.peers[&identity].key,
+                        region,
+                        connection,
+                    ),
+                }
             }
             self.process(identity, path, action).await?;
             for _ in 0..256 {
@@ -876,7 +893,7 @@ impl Engine {
                     }
                     let (path, region) = match path {
                         Path::Udp(_) => ("direct", 0),
-                        Path::Derp(region) => ("relay", region),
+                        Path::Derp(region, _) => ("relay", region),
                     };
                     if let Some(router) = self
                         .forwarding
@@ -944,7 +961,7 @@ impl Engine {
             (2, Path::Udp(source)) if message.len() >= 32 => {
                 peer.confirm_pong(source, &message[2..14], Instant::now());
             }
-            (3, Path::Derp(_)) => {
+            (3, Path::Derp(_, _)) => {
                 let (addresses, remainder) = message[2..].as_chunks::<18>();
                 if !remainder.is_empty() {
                     return;
