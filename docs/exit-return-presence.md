@@ -2,7 +2,7 @@
 
 ## What changed
 
-- 保留 Node.Online / LastSeen，并按官方顺序处理 PeerSeenChange、OnlineChange 和 PeersChangedPatch；缺失表示沿用，未知不是离线，删除的节点不能被状态增量复活。
+- 保留 Node.Online / LastSeen，并按官方语义处理 PeerSeenChange、OnlineChange 和 PeersChangedPatch；缺失表示沿用，未知不是离线，删除的节点不能被状态增量复活。
 - 向移动端传递三态在线报告、最近在线及所选出口在线报告。控制映射失效时不沿用旧的在线结论；在线变化不撤销机器身份、重置连接许可或自动更换出口。
 - ICMPv4 不可达 / 超时 / 参数问题、ICMPv6 错误仅在引用尚有效的本机出站连接时放行。允许标准的截短引用，但普通数据包仍必须完整；不放行重定向、未知连接、过期连接、错误地址族或分片引用。
 - 已连接的出口 peerapi DNS 参照官方 DNS 的十秒预算；尚未完成 TCP 建连仍保留四秒快速失败。增加真实 DNS 消息、生成响应、SERVFAIL、NXDOMAIN 和上游超时统计，不导出域名或报文。
