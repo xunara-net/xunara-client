@@ -16,6 +16,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/xunara-net/xunara-server/state"
 	"golang.org/x/net/dns/dnsmessage"
 	"tailscale.com/ipn"
 	"tailscale.com/tailcfg"
@@ -31,7 +32,8 @@ func fixturePolicy(denyPhone bool) []byte {
 	rules := []map[string]any{
 		{"action": "accept", "src": []string{"*"}, "proto": "tcp", "dst": ports},
 		{"action": "accept", "src": []string{"*"}, "proto": "udp", "dst": []string{"*:5353", "*:18088"}},
-		{"action": "accept", "src": []string{"100.80.0.0/24"}, "proto": "icmp", "dst": []string{"*:*"}},
+		// 共享回包使用保留的别名池；仍不放行 LAN 的任意 ICMP，避免绕过相关错误校验。
+		{"action": "accept", "src": []string{"100.80.0.0/24", state.ShareMasqIPv4Prefix.String()}, "proto": "icmp", "dst": []string{"*:*"}},
 		{"action": "accept", "src": []string{"fd7a:115c:a1e0::/48"}, "proto": "icmpv6", "dst": []string{"*:*"}},
 	}
 	encoded, _ := json.Marshal(map[string]any{"acls": rules})

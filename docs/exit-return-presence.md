@@ -35,6 +35,8 @@ ICMP 仍先经过固定 peer / WireGuard 身份、来源网段、其他设备地
 - Go fixture build / vet / test / race；上游 STUN / 校验和兼容向量另行显式执行，不将默认 ignored 的测试记为已执行。
 - Android 两 ABI、最终 APK 与混合客户端的执行结果记录在 Android 仓库，未执行前不据此宣称真机恢复。
 
+后续 Android 扩展回归发现夹具策略遗漏：为验证相关 ICMP 而收窄来源时，只保留了本地设备池，漏掉共享 IPv4 别名池，导致共享 Echo 被测试 ACL 拒绝。新增回归先在原策略上失败，再显式纳入服务端定义的 ShareMasqIPv4Prefix；没有恢复任意来源放行，独立 LAN / 公网来源仍被拒绝。修正后的真实 namespace 相关 ICMP 回归通过；此项只改 Go 测试夹具，不修改运行时内核或生产 ACL。
+
 ## 固定上游参考
 
 - [Node.Online / LastSeen 与 MapResponse 状态增量](https://github.com/tailscale/tailscale/blob/v1.98.8/tailcfg/tailcfg.go)
